@@ -33,7 +33,7 @@ def save_state():
 
 def get_recent_original_tweets(username, limit=5):
     tweets = []
-    scraper = sntwitter.TwitterUserScraper(username)
+    scraper = sntwitter.TwitterSearchScraper(f"from:{username}")
 
     for tweet in scraper.get_items():
         if tweet.inReplyToTweetId is not None:
