@@ -1,1 +1,1 @@
-worker: python x_alert_bot.py
+worker: python mlb_hr_alert_bot.py
