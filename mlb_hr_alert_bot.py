@@ -2,7 +2,7 @@ import os
 import json
 import asyncio
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime
 
 import discord
 import requests
@@ -13,7 +13,6 @@ DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "15"))
 TIMEZONE = os.getenv("TIMEZONE", "America/Chicago")
 
-# Near-HR thresholds
 NEAR_HR_MIN_EV = float(os.getenv("NEAR_HR_MIN_EV", "100"))
 NEAR_HR_MIN_ANGLE = float(os.getenv("NEAR_HR_MIN_ANGLE", "20"))
 NEAR_HR_MAX_ANGLE = float(os.getenv("NEAR_HR_MAX_ANGLE", "40"))
@@ -36,12 +35,37 @@ state = {
 }
 
 TEAM_LOGO_SLUGS = {
-    "AZ": "ari", "ATL": "atl", "BAL": "bal", "BOS": "bos", "CHC": "chc", "CWS": "chw",
-    "CIN": "cin", "CLE": "cle", "COL": "col", "DET": "det", "HOU": "hou", "KC": "kc",
-    "LAA": "laa", "LAD": "lad", "MIA": "mia", "MIL": "mil", "MIN": "min", "NYM": "nym",
-    "NYY": "nyy", "ATH": "oak", "OAK": "oak", "PHI": "phi", "PIT": "pit", "SD": "sd",
-    "SEA": "sea", "SF": "sf", "STL": "stl", "TB": "tb", "TEX": "tex", "TOR": "tor",
-    "WSH": "wsh"
+    "AZ": "ari",
+    "ATL": "atl",
+    "BAL": "bal",
+    "BOS": "bos",
+    "CHC": "chc",
+    "CWS": "chw",
+    "CIN": "cin",
+    "CLE": "cle",
+    "COL": "col",
+    "DET": "det",
+    "HOU": "hou",
+    "KC": "kc",
+    "LAA": "laa",
+    "LAD": "lad",
+    "MIA": "mia",
+    "MIL": "mil",
+    "MIN": "min",
+    "NYM": "nym",
+    "NYY": "nyy",
+    "ATH": "oak",
+    "OAK": "oak",
+    "PHI": "phi",
+    "PIT": "pit",
+    "SD": "sd",
+    "SEA": "sea",
+    "SF": "sf",
+    "STL": "stl",
+    "TB": "tb",
+    "TEX": "tex",
+    "TOR": "tor",
+    "WSH": "wsh",
 }
 
 def logo_url_for_abbr(abbr: str) -> str | None:
@@ -62,7 +86,6 @@ def load_state():
     state.setdefault("last_startup_date", None)
 
 def save_state():
-    # keep state bounded
     state["seen_hr_play_ids"] = state["seen_hr_play_ids"][-500:]
     state["seen_near_hr_play_ids"] = state["seen_near_hr_play_ids"][-1000:]
     STATE_FILE.write_text(json.dumps(state, indent=2))
@@ -74,12 +97,6 @@ def get_json(url: str, timeout: int = 20):
 
 def today_str() -> str:
     return datetime.now(TZ).strftime("%Y-%m-%d")
-
-def parse_iso(iso_str: str):
-    try:
-        return datetime.fromisoformat(iso_str.replace("Z", "+00:00")).astimezone(TZ)
-    except Exception:
-        return None
 
 def get_today_games():
     data = get_json(SCHEDULE_URL.format(date=today_str()))
@@ -153,9 +170,6 @@ def build_play_id(game_pk, play):
     return f'{game_pk}:{about.get("atBatIndex")}:{about.get("halfInning")}:{about.get("inning")}'
 
 def pick_batting_team(game, play):
-    matchup = play.get("matchup") or {}
-    batter_team_id = ((matchup.get("batSide") or {}).get("code"))  # not team
-    # infer from half inning
     half = ((play.get("about") or {}).get("halfInning") or "").lower()
     return game["away"] if half == "top" else game["home"]
 
@@ -165,7 +179,7 @@ def score_line(play):
     away = result.get("awayScore")
     if home is None or away is None:
         return None
-    return f'{away}-{home}'
+    return f"{away}-{home}"
 
 async def send_startup_message():
     channel = await client.fetch_channel(DISCORD_CHANNEL_ID)
@@ -187,10 +201,12 @@ async def send_alert(channel, game, play, alert_type: str):
     inning = about.get("inning")
     half = (about.get("halfInning") or "").title()
     game_pk = game["gamePk"]
+
     batting_team = pick_batting_team(game, play)
     team_abbr = batting_team.get("abbreviation", "")
     team_name = batting_team.get("name", "Team")
     logo = logo_url_for_abbr(team_abbr)
+
     metrics = play_metrics(play)
     score = score_line(play)
 
@@ -204,7 +220,8 @@ async def send_alert(channel, game, play, alert_type: str):
     embed = discord.Embed(
         title=title,
         description=description[:4096],
-        color=color
+        color=color,
+        url=f"https://www.mlb.com/gameday/{game_pk}",
     )
     embed.add_field(name="Batter", value=batter, inline=True)
     embed.add_field(name="Pitcher", value=pitcher, inline=True)
@@ -215,22 +232,18 @@ async def send_alert(channel, game, play, alert_type: str):
     embed.add_field(name="Score", value=score or "—", inline=True)
 
     if metrics:
-        ev = metrics.get("ev")
-        la = metrics.get("la")
-        dist = metrics.get("dist")
         metric_parts = []
-        if ev is not None:
-            metric_parts.append(f"EV: {ev:.1f} mph")
-        if la is not None:
-            metric_parts.append(f"LA: {la:.1f}°")
-        if dist is not None:
-            metric_parts.append(f"Dist: {dist:.0f} ft")
+        if metrics.get("ev") is not None:
+            metric_parts.append(f'EV: {metrics["ev"]:.1f} mph')
+        if metrics.get("la") is not None:
+            metric_parts.append(f'LA: {metrics["la"]:.1f}°')
+        if metrics.get("dist") is not None:
+            metric_parts.append(f'Dist: {metrics["dist"]:.0f} ft')
         if metric_parts:
             embed.add_field(name="Contact", value=" | ".join(metric_parts), inline=False)
 
-    gameday_url = f"https://www.mlb.com/gameday/{game_pk}"
-    embed.url = gameday_url
     embed.set_footer(text="MLB live feed")
+
     if logo:
         embed.set_thumbnail(url=logo)
 
@@ -277,13 +290,16 @@ async def poll_loop():
     while not client.is_closed():
         try:
             games = await asyncio.to_thread(get_today_games)
-            liveish = []
+            active_games = []
             for game in games:
                 status = (game.get("status") or "").lower()
-                if any(x in status for x in ["in progress", "manager challenge", "review", "delayed", "warmup", "pre-game", "scheduled"]):
-                    liveish.append(game)
+                if any(x in status for x in [
+                    "in progress", "manager challenge", "review",
+                    "delayed", "warmup", "pre-game", "scheduled"
+                ]):
+                    active_games.append(game)
 
-            for game in liveish:
+            for game in active_games:
                 try:
                     await process_game(channel, game)
                 except Exception as e:
