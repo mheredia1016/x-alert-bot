@@ -31,298 +31,195 @@ client = discord.Client(intents=intents)
 state = {
     "seen_hr_play_ids": [],
     "seen_near_hr_play_ids": [],
-    "last_startup_date": None
+    "last_startup_date": None,
 }
 
-TEAM_LOGO_SLUGS = {
-    "AZ": "ari",
-    "ATL": "atl",
-    "BAL": "bal",
-    "BOS": "bos",
-    "CHC": "chc",
-    "CWS": "chw",
-    "CIN": "cin",
-    "CLE": "cle",
-    "COL": "col",
-    "DET": "det",
-    "HOU": "hou",
-    "KC": "kc",
-    "LAA": "laa",
-    "LAD": "lad",
-    "MIA": "mia",
-    "MIL": "mil",
-    "MIN": "min",
-    "NYM": "nym",
-    "NYY": "nyy",
-    "ATH": "oak",
-    "OAK": "oak",
-    "PHI": "phi",
-    "PIT": "pit",
-    "SD": "sd",
-    "SEA": "sea",
-    "SF": "sf",
-    "STL": "stl",
-    "TB": "tb",
-    "TEX": "tex",
-    "TOR": "tor",
-    "WSH": "wsh",
+TEAM_COLORS = {
+    "NYY": 0x132448, "BOS": 0xBD3039, "LAD": 0x005A9C, "CHC": 0x0E3386,
+    "ATL": 0xCE1141, "HOU": 0xEB6E1F, "PHI": 0xE81828, "NYM": 0x002D72
 }
 
-def logo_url_for_abbr(abbr: str) -> str | None:
-    slug = TEAM_LOGO_SLUGS.get(abbr)
-    if not slug:
-        return None
-    return f"https://a.espncdn.com/i/teamlogos/mlb/500/{slug}.png"
+
+# -----------------------------
+# HELPERS
+# -----------------------------
 
 def load_state():
     global state
     if STATE_FILE.exists():
         try:
             state = json.loads(STATE_FILE.read_text())
-        except Exception:
+        except:
             pass
-    state.setdefault("seen_hr_play_ids", [])
-    state.setdefault("seen_near_hr_play_ids", [])
-    state.setdefault("last_startup_date", None)
+
 
 def save_state():
-    state["seen_hr_play_ids"] = state["seen_hr_play_ids"][-500:]
-    state["seen_near_hr_play_ids"] = state["seen_near_hr_play_ids"][-1000:]
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
-def get_json(url: str, timeout: int = 20):
-    r = session.get(url, timeout=timeout)
+
+def get_json(url):
+    r = session.get(url, timeout=20)
     r.raise_for_status()
     return r.json()
 
-def today_str() -> str:
+
+def today_str():
     return datetime.now(TZ).strftime("%Y-%m-%d")
 
-def get_today_games():
-    data = get_json(SCHEDULE_URL.format(date=today_str()))
-    games = []
-    for date_block in data.get("dates", []):
-        for game in date_block.get("games", []):
-            games.append({
-                "gamePk": game.get("gamePk"),
-                "gameDate": game.get("gameDate"),
-                "status": (game.get("status") or {}).get("detailedState"),
-                "away": ((game.get("teams") or {}).get("away") or {}).get("team", {}),
-                "home": ((game.get("teams") or {}).get("home") or {}).get("team", {}),
-            })
-    return games
 
 def game_label(game):
-    away_abbr = game["away"].get("abbreviation", "AWAY")
-    home_abbr = game["home"].get("abbreviation", "HOME")
-    return f"{away_abbr} @ {home_abbr}"
+    away = game["away"]
+    home = game["home"]
 
-def likely_near_hr(play):
-    result = ((play.get("result") or {}).get("eventType") or "").lower()
-    if result == "home_run":
+    away_name = away.get("teamName") or away.get("name") or away.get("abbreviation") or "Away"
+    home_name = home.get("teamName") or home.get("name") or home.get("abbreviation") or "Home"
+
+    return f"{away_name} @ {home_name}"
+
+
+def team_logo(team_id):
+    return f"https://statsapi.mlb.com/api/v1/teams/{team_id}/logo"
+
+
+def player_headshot(player_id):
+    return f"https://img.mlbstatic.com/mlb-photos/image/upload/w_180/v1/people/{player_id}/headshot/67/current"
+
+
+def is_home_run(play):
+    text = f"{play.get('result',{})}".lower()
+    return any(x in text for x in ["home_run", "home run", "homer", "grand slam"])
+
+
+def get_metrics(play):
+    for e in reversed(play.get("playEvents", [])):
+        if e.get("hitData"):
+            return e["hitData"]
+    return None
+
+
+def is_near_hr(play):
+    if is_home_run(play):
         return False
 
-    play_events = play.get("playEvents") or []
-    hit_data = None
-    for event in reversed(play_events):
-        hd = event.get("hitData")
-        if hd:
-            hit_data = hd
-            break
-
-    if not hit_data:
+    m = get_metrics(play)
+    if not m:
         return False
 
-    launch_speed = hit_data.get("launchSpeed")
-    launch_angle = hit_data.get("launchAngle")
-    total_distance = hit_data.get("totalDistance")
+    ev = m.get("launchSpeed")
+    la = m.get("launchAngle")
+    dist = m.get("totalDistance")
 
-    if launch_speed is None or launch_angle is None or total_distance is None:
+    if not all([ev, la, dist]):
         return False
 
-    return (
-        launch_speed >= NEAR_HR_MIN_EV and
-        NEAR_HR_MIN_ANGLE <= launch_angle <= NEAR_HR_MAX_ANGLE and
-        total_distance >= NEAR_HR_MIN_DISTANCE
-    )
+    return ev >= NEAR_HR_MIN_EV and 20 <= la <= 40 and dist >= NEAR_HR_MIN_DISTANCE
 
-def play_metrics(play):
-    play_events = play.get("playEvents") or []
-    hit_data = None
-    for event in reversed(play_events):
-        hd = event.get("hitData")
-        if hd:
-            hit_data = hd
-            break
-    if not hit_data:
-        return None
-    return {
-        "ev": hit_data.get("launchSpeed"),
-        "la": hit_data.get("launchAngle"),
-        "dist": hit_data.get("totalDistance"),
-        "traj": hit_data.get("trajectory"),
-        "hardness": hit_data.get("hardness"),
-        "location": hit_data.get("location")
-    }
 
-def build_play_id(game_pk, play):
-    about = play.get("about") or {}
-    return f'{game_pk}:{about.get("atBatIndex")}:{about.get("halfInning")}:{about.get("inning")}'
+# -----------------------------
+# ALERT
+# -----------------------------
 
-def pick_batting_team(game, play):
-    half = ((play.get("about") or {}).get("halfInning") or "").lower()
-    return game["away"] if half == "top" else game["home"]
+async def send_alert(channel, game, play, alert_type):
+    result = play.get("result", {})
+    matchup = play.get("matchup", {})
 
-def score_line(play):
-    result = play.get("result") or {}
-    home = result.get("homeScore")
-    away = result.get("awayScore")
-    if home is None or away is None:
-        return None
-    return f"{away}-{home}"
+    batter = matchup.get("batter", {})
+    pitcher = matchup.get("pitcher", {})
 
-async def send_startup_message():
-    channel = await client.fetch_channel(DISCORD_CHANNEL_ID)
-    msg_date = today_str()
-    if state.get("last_startup_date") == msg_date:
-        return
-    await channel.send("✅ MLB HR/Near-HR bot is online.")
-    state["last_startup_date"] = msg_date
-    save_state()
+    batter_name = batter.get("fullName", "Unknown")
+    pitcher_name = pitcher.get("fullName", "Unknown")
 
-async def send_alert(channel, game, play, alert_type: str):
-    result = play.get("result") or {}
-    matchup = play.get("matchup") or {}
-    batter = (matchup.get("batter") or {}).get("fullName", "Unknown batter")
-    pitcher = (matchup.get("pitcher") or {}).get("fullName", "Unknown pitcher")
-    event = result.get("event", "Play")
-    description = result.get("description") or event
-    about = play.get("about") or {}
-    inning = about.get("inning")
-    half = (about.get("halfInning") or "").title()
-    game_pk = game["gamePk"]
+    team = game["away"] if play["about"]["halfInning"] == "top" else game["home"]
 
-    batting_team = pick_batting_team(game, play)
-    team_abbr = batting_team.get("abbreviation", "")
-    team_name = batting_team.get("name", "Team")
-    logo = logo_url_for_abbr(team_abbr)
+    team_id = team.get("id")
+    team_abbr = team.get("abbreviation", "MLB")
 
-    metrics = play_metrics(play)
-    score = score_line(play)
+    color = TEAM_COLORS.get(team_abbr, 0x1D428A)
 
-    if alert_type == "hr":
-        title = "💣 Home Run"
-        color = discord.Color.red()
-    else:
-        title = "⚠️ Near Home Run"
-        color = discord.Color.orange()
+    title = "💣 Home Run" if alert_type == "hr" else "⚠️ Near Home Run"
 
     embed = discord.Embed(
         title=title,
-        description=description[:4096],
-        color=color,
-        url=f"https://www.mlb.com/gameday/{game_pk}",
+        description=result.get("description"),
+        color=color
     )
-    embed.add_field(name="Batter", value=batter, inline=True)
-    embed.add_field(name="Pitcher", value=pitcher, inline=True)
-    embed.add_field(name="Game", value=game_label(game), inline=True)
 
-    embed.add_field(name="Team", value=f"{team_name} ({team_abbr})", inline=True)
-    embed.add_field(name="Inning", value=f"{half} {inning}", inline=True)
-    embed.add_field(name="Score", value=score or "—", inline=True)
+    embed.add_field(name="Game", value=game_label(game), inline=False)
+    embed.add_field(name="Batter", value=batter_name)
+    embed.add_field(name="Pitcher", value=pitcher_name)
 
-    if metrics:
-        metric_parts = []
-        if metrics.get("ev") is not None:
-            metric_parts.append(f'EV: {metrics["ev"]:.1f} mph')
-        if metrics.get("la") is not None:
-            metric_parts.append(f'LA: {metrics["la"]:.1f}°')
-        if metrics.get("dist") is not None:
-            metric_parts.append(f'Dist: {metrics["dist"]:.0f} ft')
-        if metric_parts:
-            embed.add_field(name="Contact", value=" | ".join(metric_parts), inline=False)
+    m = get_metrics(play)
+    if m:
+        embed.add_field(
+            name="Contact",
+            value=f"EV {m.get('launchSpeed')} | LA {m.get('launchAngle')} | {m.get('totalDistance')} ft",
+            inline=False
+        )
 
-    embed.set_footer(text="MLB live feed")
-
-    if logo:
-        embed.set_thumbnail(url=logo)
+    embed.set_thumbnail(url=team_logo(team_id))
+    embed.set_image(url=player_headshot(batter.get("id")))
 
     await channel.send(embed=embed)
 
+
+# -----------------------------
+# PROCESS
+# -----------------------------
+
 async def process_game(channel, game):
-    game_pk = game["gamePk"]
-    feed = await asyncio.to_thread(get_json, LIVE_FEED_URL.format(gamePk=game_pk))
-    all_plays = (((feed.get("liveData") or {}).get("plays") or {}).get("allPlays") or [])
+    data = get_json(LIVE_FEED_URL.format(gamePk=game["gamePk"]))
+    plays = data["liveData"]["plays"]["allPlays"]
 
-    new_hr_ids = []
-    new_near_ids = []
+    for play in plays:
+        pid = f"{game['gamePk']}-{play['about']['atBatIndex']}"
 
-    for play in all_plays:
-        result = play.get("result") or {}
-        event_type = (result.get("eventType") or "").lower()
-        play_id = build_play_id(game_pk, play)
+        if is_home_run(play):
+            if pid not in state["seen_hr_play_ids"]:
+                await send_alert(channel, game, play, "hr")
+                state["seen_hr_play_ids"].append(pid)
+        elif is_near_hr(play):
+            if pid not in state["seen_near_hr_play_ids"]:
+                await send_alert(channel, game, play, "near")
+                state["seen_near_hr_play_ids"].append(pid)
 
-        if event_type == "home_run":
-            if play_id not in state["seen_hr_play_ids"]:
-                new_hr_ids.append((play_id, play))
-        elif likely_near_hr(play):
-            if play_id not in state["seen_near_hr_play_ids"]:
-                new_near_ids.append((play_id, play))
 
-    for play_id, play in new_hr_ids:
-        await send_alert(channel, game, play, "hr")
-        state["seen_hr_play_ids"].append(play_id)
-        await asyncio.sleep(0.5)
+# -----------------------------
+# LOOP
+# -----------------------------
 
-    for play_id, play in new_near_ids:
-        await send_alert(channel, game, play, "near_hr")
-        state["seen_near_hr_play_ids"].append(play_id)
-        await asyncio.sleep(0.5)
-
-    if new_hr_ids or new_near_ids:
-        save_state()
-
-async def poll_loop():
+async def loop():
     await client.wait_until_ready()
     channel = await client.fetch_channel(DISCORD_CHANNEL_ID)
-    await send_startup_message()
 
-    while not client.is_closed():
+    await channel.send("✅ MLB bot is live")
+
+    while True:
         try:
-            games = await asyncio.to_thread(get_today_games)
-            active_games = []
-            for game in games:
-                status = (game.get("status") or "").lower()
-                if any(x in status for x in [
-                    "in progress", "manager challenge", "review",
-                    "delayed", "warmup", "pre-game", "scheduled"
-                ]):
-                    active_games.append(game)
+            data = get_json(SCHEDULE_URL.format(date=today_str()))
+            games = data["dates"][0]["games"]
 
-            for game in active_games:
-                try:
-                    await process_game(channel, game)
-                except Exception as e:
-                    print(f"Error processing game {game.get('gamePk')}: {e}")
-                await asyncio.sleep(0.25)
+            for g in games:
+                game = {
+                    "gamePk": g["gamePk"],
+                    "away": g["teams"]["away"]["team"],
+                    "home": g["teams"]["home"]["team"]
+                }
+
+                await process_game(channel, game)
+                await asyncio.sleep(1)
 
         except Exception as e:
-            print(f"Polling loop error: {e}")
+            print("ERROR:", e)
 
+        save_state()
         await asyncio.sleep(POLL_SECONDS)
+
 
 @client.event
 async def on_ready():
-    print(f"Logged in as {client.user} ({client.user.id})")
-    client.loop.create_task(poll_loop())
+    print("Bot ready")
+    client.loop.create_task(loop())
 
-def main():
-    if not DISCORD_TOKEN:
-        raise ValueError("Missing DISCORD_TOKEN")
-    if DISCORD_CHANNEL_ID == 0:
-        raise ValueError("Missing or invalid DISCORD_CHANNEL_ID")
-    load_state()
-    client.run(DISCORD_TOKEN)
 
-if __name__ == "__main__":
-    main()
+load_state()
+client.run(DISCORD_TOKEN)
