@@ -21,14 +21,6 @@ DAILY_RECAP_HOUR = int(os.getenv("DAILY_RECAP_HOUR", "8"))
 HOT_STREAK_DAYS = int(os.getenv("HOT_STREAK_DAYS", "7"))
 HOT_STREAK_TOP_N = int(os.getenv("HOT_STREAK_TOP_N", "8"))
 
-# The Odds API settings
-ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
-ODDS_REGION = os.getenv("ODDS_REGION", "us")
-ODDS_FORMAT = os.getenv("ODDS_FORMAT", "american")
-ODDS_BOOKMAKERS = os.getenv("ODDS_BOOKMAKERS", "")  # comma-separated optional filter
-ODDS_TARGET_COUNT = int(os.getenv("ODDS_TARGET_COUNT", "8"))
-ODDS_LONGSHOT_MIN = int(os.getenv("ODDS_LONGSHOT_MIN", "450"))
-
 # Tighter near-HR thresholds
 NEAR_HR_MIN_EV = float(os.getenv("NEAR_HR_MIN_EV", "102"))
 NEAR_HR_MIN_ANGLE = float(os.getenv("NEAR_HR_MIN_ANGLE", "22"))
@@ -40,9 +32,6 @@ STATE_FILE = Path("mlb_hr_alert_state.json")
 SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date}"
 LIVE_FEED_URL = "https://statsapi.mlb.com/api/v1.1/game/{gamePk}/feed/live"
 BOXSCORE_URL = "https://statsapi.mlb.com/api/v1/game/{gamePk}/boxscore"
-
-ODDS_API_BASE = "https://api.the-odds-api.com/v4"
-ODDS_SPORT_KEY = "baseball_mlb"
 
 TZ = ZoneInfo(TIMEZONE)
 session = requests.Session()
@@ -56,8 +45,6 @@ logging.basicConfig(
 log = logging.getLogger("mlb_hr_alert_bot")
 
 intents = discord.Intents.default()
-intents.messages = True
-intents.message_content = True
 client = discord.Client(intents=intents)
 
 state = {
@@ -166,8 +153,8 @@ def save_state():
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-def get_json(url: str, params: dict | None = None) -> dict:
-    resp = session.get(url, params=params, timeout=25)
+def get_json(url: str) -> dict:
+    resp = session.get(url, timeout=20)
     resp.raise_for_status()
     return resp.json()
 
@@ -603,132 +590,6 @@ def build_hot_streaks(end_date_days_ago: int = 1, window_days: int = HOT_STREAK_
     return hot[:top_n]
 
 
-def fetch_today_odds_events():
-    if not ODDS_API_KEY:
-        return []
-
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "regions": ODDS_REGION,
-        "oddsFormat": ODDS_FORMAT,
-    }
-
-    if ODDS_BOOKMAKERS.strip():
-        params["bookmakers"] = ODDS_BOOKMAKERS.strip()
-
-    url = f"{ODDS_API_BASE}/sports/{ODDS_SPORT_KEY}/odds"
-    return get_json(url, params=params)
-
-
-def fetch_event_hr_prop_odds(event_id: str):
-    if not ODDS_API_KEY:
-        return {}
-
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "regions": ODDS_REGION,
-        "markets": "batter_home_runs",
-        "oddsFormat": ODDS_FORMAT,
-    }
-
-    if ODDS_BOOKMAKERS.strip():
-        params["bookmakers"] = ODDS_BOOKMAKERS.strip()
-
-    url = f"{ODDS_API_BASE}/sports/{ODDS_SPORT_KEY}/events/{event_id}/odds"
-    return get_json(url, params=params)
-
-
-def normalize_player_name(name: str) -> str:
-    return " ".join((name or "").lower().replace(".", "").replace("'", "").split())
-
-
-def parse_best_hr_prices_from_event(event_data: dict):
-    best = {}
-
-    for bookmaker in event_data.get("bookmakers", []):
-        book_title = bookmaker.get("title", bookmaker.get("key", "Book"))
-        for market in bookmaker.get("markets", []):
-            if market.get("key") != "batter_home_runs":
-                continue
-
-            for outcome in market.get("outcomes", []):
-                if outcome.get("name") != "Over":
-                    continue
-                if outcome.get("point") != 0.5:
-                    continue
-
-                player_name = outcome.get("description")
-                price = outcome.get("price")
-                if not player_name or price is None:
-                    continue
-
-                key = normalize_player_name(player_name)
-                current = best.get(key)
-                if current is None or price > current["price"]:
-                    best[key] = {
-                        "player_name": player_name,
-                        "price": price,
-                        "bookmaker": book_title,
-                    }
-
-    return best
-
-
-def build_today_hr_targets(hot_streaks: list[dict], top_n: int = ODDS_TARGET_COUNT):
-    if not ODDS_API_KEY:
-        return {"targets": [], "longshots": [], "note": "ODDS_API_KEY not set"}
-
-    events = fetch_today_odds_events()
-    merged_prices = {}
-
-    for event in events:
-        event_id = event.get("id")
-        if not event_id:
-            continue
-
-        try:
-            event_odds = fetch_event_hr_prop_odds(event_id)
-        except Exception as exc:
-            log.warning("Could not load event odds for %s: %s", event_id, exc)
-            continue
-
-        event_best = parse_best_hr_prices_from_event(event_odds)
-        for key, value in event_best.items():
-            current = merged_prices.get(key)
-            if current is None or value["price"] > current["price"]:
-                merged_prices[key] = value
-
-    ranked = []
-    for row in hot_streaks:
-        key = normalize_player_name(row["name"])
-        price_info = merged_prices.get(key)
-        if not price_info:
-            continue
-
-        score = (
-            row["total_hr"] * 10
-            + row["streak_days"] * 6
-            + max(price_info["price"], 0) / 100.0
-        )
-
-        ranked.append({
-            "name": row["name"],
-            "team_abbr": row["team_abbr"],
-            "total_hr": row["total_hr"],
-            "streak_days": row["streak_days"],
-            "best_price": price_info["price"],
-            "best_bookmaker": price_info["bookmaker"],
-            "score": score,
-        })
-
-    ranked.sort(key=lambda x: (-x["score"], -x["best_price"], x["name"]))
-
-    targets = ranked[:top_n]
-    longshots = [r for r in ranked if r["best_price"] >= ODDS_LONGSHOT_MIN][:top_n]
-
-    return {"targets": targets, "longshots": longshots, "note": None}
-
-
 def split_lines_into_chunks(header: str, lines: list[str], limit: int = 1900):
     chunks = []
     current = header
@@ -759,7 +620,6 @@ async def post_daily_hr_recap(force: bool = False):
     try:
         recap = await asyncio.to_thread(build_yesterday_recap, target_date)
         hot_streaks = await asyncio.to_thread(build_hot_streaks)
-        today_targets = await asyncio.to_thread(build_today_hr_targets, hot_streaks)
     except Exception as exc:
         log.exception("Failed building daily recap: %s", exc)
         return
@@ -813,58 +673,6 @@ async def post_daily_hr_recap(force: bool = False):
 
         embed.set_footer(text=f"Updated daily at {DAILY_RECAP_HOUR}:00 {TIMEZONE}")
         await channel.send(embed=embed)
-
-    if today_targets["note"]:
-        await channel.send(f"🎯 Today's HR Targets unavailable: {today_targets['note']}")
-    else:
-        targets = today_targets["targets"]
-        longshots = today_targets["longshots"]
-
-        if targets:
-            embed = discord.Embed(
-                title="🎯 Today's HR Targets",
-                color=discord.Color.blue(),
-                description="Ranked from hot streak + best available HR price",
-            )
-
-            for row in targets:
-                streak_text = f"{row['streak_days']} straight day" if row["streak_days"] == 1 else f"{row['streak_days']} straight days"
-                if row["streak_days"] == 0:
-                    streak_text = "No current streak"
-                embed.add_field(
-                    name=f"{row['name']} ({row['team_abbr']})",
-                    value=(
-                        f"Best HR odds: **{row['best_price']:+}** at {row['best_bookmaker']}\n"
-                        f"{row['total_hr']} HR in last {HOT_STREAK_DAYS} days | {streak_text}"
-                    ),
-                    inline=False,
-                )
-
-            top_logo = team_logo(targets[0]["team_abbr"])
-            if top_logo:
-                embed.set_thumbnail(url=top_logo)
-
-            embed.set_footer(text="The Odds API integration")
-            await channel.send(embed=embed)
-
-        if longshots:
-            embed = discord.Embed(
-                title=f"🧨 Longshot HR Looks (+{ODDS_LONGSHOT_MIN} or longer)",
-                color=discord.Color.purple(),
-                description="Hot bats with bigger prices",
-            )
-
-            for row in longshots:
-                embed.add_field(
-                    name=f"{row['name']} ({row['team_abbr']})",
-                    value=(
-                        f"Best HR odds: **{row['best_price']:+}** at {row['best_bookmaker']}\n"
-                        f"{row['total_hr']} HR in last {HOT_STREAK_DAYS} days"
-                    ),
-                    inline=False,
-                )
-
-            await channel.send(embed=embed)
 
     state["last_daily_recap_date"] = target_date
     save_state()
