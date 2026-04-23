@@ -1,17 +1,25 @@
+
 import os
 import json
 import asyncio
+import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import discord
 import requests
 from zoneinfo import ZoneInfo
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "15"))
 TIMEZONE = os.getenv("TIMEZONE", "America/Chicago")
+
+# Daily recap settings
+DAILY_RECAP_HOUR = int(os.getenv("DAILY_RECAP_HOUR", "8"))
+HOT_STREAK_DAYS = int(os.getenv("HOT_STREAK_DAYS", "7"))
+HOT_STREAK_TOP_N = int(os.getenv("HOT_STREAK_TOP_N", "8"))
 
 # Tighter near-HR thresholds
 NEAR_HR_MIN_EV = float(os.getenv("NEAR_HR_MIN_EV", "102"))
@@ -23,9 +31,18 @@ NEAR_HR_CONFIRM_DELAY = float(os.getenv("NEAR_HR_CONFIRM_DELAY", "4"))
 STATE_FILE = Path("mlb_hr_alert_state.json")
 SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date}"
 LIVE_FEED_URL = "https://statsapi.mlb.com/api/v1.1/game/{gamePk}/feed/live"
+BOXSCORE_URL = "https://statsapi.mlb.com/api/v1/game/{gamePk}/boxscore"
 
 TZ = ZoneInfo(TIMEZONE)
 session = requests.Session()
+scheduler = AsyncIOScheduler(timezone=TZ)
+loop_task = None
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("mlb_hr_alert_bot")
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
@@ -35,6 +52,7 @@ state = {
     "seen_near_hr_play_ids": [],
     "pending_near_hr_play_ids": [],
     "last_startup_date": None,
+    "last_daily_recap_date": None,
 }
 
 TEAM_COLORS = {
@@ -106,18 +124,26 @@ TEAM_LOGO_SLUGS = {
 }
 
 
+def require_env() -> None:
+    if not DISCORD_TOKEN:
+        raise RuntimeError("Missing DISCORD_TOKEN")
+    if not DISCORD_CHANNEL_ID:
+        raise RuntimeError("Missing DISCORD_CHANNEL_ID")
+
+
 def load_state():
     global state
     if STATE_FILE.exists():
         try:
             state = json.loads(STATE_FILE.read_text())
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("Could not load state file: %s", exc)
 
     state.setdefault("seen_hr_play_ids", [])
     state.setdefault("seen_near_hr_play_ids", [])
     state.setdefault("pending_near_hr_play_ids", [])
     state.setdefault("last_startup_date", None)
+    state.setdefault("last_daily_recap_date", None)
 
 
 def save_state():
@@ -127,14 +153,22 @@ def save_state():
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-def get_json(url):
-    r = session.get(url, timeout=20)
-    r.raise_for_status()
-    return r.json()
+def get_json(url: str) -> dict:
+    resp = session.get(url, timeout=20)
+    resp.raise_for_status()
+    return resp.json()
 
 
-def today_str():
+def today_str() -> str:
     return datetime.now(TZ).strftime("%Y-%m-%d")
+
+
+def day_str(days_ago: int) -> str:
+    return (datetime.now(TZ) - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+
+
+def yesterday_str() -> str:
+    return day_str(1)
 
 
 def game_label(game):
@@ -170,7 +204,6 @@ def ordinal(n):
 
 def is_home_run(play):
     result = play.get("result", {})
-
     event_type = (result.get("eventType") or "").lower().strip()
     event = (result.get("event") or "").lower().strip()
     description = (result.get("description") or "").lower().strip()
@@ -245,8 +278,8 @@ def player_hr_number_in_game(all_plays, current_play):
     return hr_count if hr_count > 0 else None
 
 
-def get_today_games():
-    data = get_json(SCHEDULE_URL.format(date=today_str()))
+def get_games_for_date(date_str: str):
+    data = get_json(SCHEDULE_URL.format(date=date_str))
     games = []
 
     for date_block in data.get("dates", []):
@@ -259,6 +292,10 @@ def get_today_games():
             })
 
     return games
+
+
+def get_today_games():
+    return get_games_for_date(today_str())
 
 
 def build_play_id(game_pk, play):
@@ -394,8 +431,8 @@ async def confirm_and_send_near_hr(channel, game, play_id):
             state["pending_near_hr_play_ids"].remove(play_id)
         save_state()
 
-    except Exception as e:
-        print(f"Error confirming near HR {play_id}: {e}")
+    except Exception as exc:
+        log.warning("Error confirming near HR %s: %s", play_id, exc)
         if play_id in state["pending_near_hr_play_ids"]:
             state["pending_near_hr_play_ids"].remove(play_id)
         save_state()
@@ -430,6 +467,218 @@ async def process_game(channel, game):
     save_state()
 
 
+def _collect_boxscore_hitters(game_pk: int):
+    data = get_json(BOXSCORE_URL.format(gamePk=game_pk))
+    results = []
+
+    for side in ("away", "home"):
+        team_block = (data.get("teams") or {}).get(side) or {}
+        team_info = team_block.get("team") or {}
+        team_abbr = team_info.get("abbreviation") or team_info.get("name") or ""
+        players = team_block.get("players") or {}
+
+        for player in players.values():
+            person = player.get("person") or {}
+            batting = ((player.get("stats") or {}).get("batting") or {})
+            hr_count = batting.get("homeRuns", 0) or 0
+
+            if hr_count > 0:
+                results.append({
+                    "player_id": person.get("id"),
+                    "name": person.get("fullName", "Unknown"),
+                    "team_abbr": team_abbr,
+                    "hr_count": hr_count,
+                })
+
+    return results
+
+
+def build_yesterday_recap(target_date: str):
+    recap_games = []
+    total_hr = 0
+    unique_players = set()
+
+    for game in get_games_for_date(target_date):
+        game_pk = game.get("gamePk")
+        if not game_pk:
+            continue
+
+        try:
+            hitters = _collect_boxscore_hitters(game_pk)
+        except Exception as exc:
+            log.warning("Could not load boxscore for game %s: %s", game_pk, exc)
+            continue
+
+        if not hitters:
+            continue
+
+        hitters.sort(key=lambda x: (-x["hr_count"], x["name"]))
+        recap_games.append({
+            "label": game_label(game),
+            "hitters": hitters,
+        })
+
+        for hitter in hitters:
+            total_hr += hitter["hr_count"]
+            unique_players.add(hitter["name"])
+
+    return {
+        "date": target_date,
+        "games": recap_games,
+        "total_hr": total_hr,
+        "unique_players": len(unique_players),
+    }
+
+
+def build_hot_streaks(end_date_days_ago: int = 1, window_days: int = HOT_STREAK_DAYS, top_n: int = HOT_STREAK_TOP_N):
+    totals = {}
+    daily_counts = []
+
+    for days_ago in range(end_date_days_ago + window_days - 1, end_date_days_ago - 1, -1):
+        date_str = day_str(days_ago)
+        day_counts = {}
+
+        for game in get_games_for_date(date_str):
+            game_pk = game.get("gamePk")
+            if not game_pk:
+                continue
+
+            try:
+                hitters = _collect_boxscore_hitters(game_pk)
+            except Exception as exc:
+                log.warning("Could not load hot-streak boxscore for game %s: %s", game_pk, exc)
+                continue
+
+            for hitter in hitters:
+                key = hitter["player_id"] or hitter["name"]
+                if key not in totals:
+                    totals[key] = {
+                        "player_id": hitter["player_id"],
+                        "name": hitter["name"],
+                        "team_abbr": hitter["team_abbr"],
+                        "total_hr": 0,
+                        "days": {},
+                    }
+
+                totals[key]["total_hr"] += hitter["hr_count"]
+                totals[key]["team_abbr"] = hitter["team_abbr"]
+                totals[key]["days"][date_str] = totals[key]["days"].get(date_str, 0) + hitter["hr_count"]
+                day_counts[key] = day_counts.get(key, 0) + hitter["hr_count"]
+
+        daily_counts.append((date_str, day_counts))
+
+    hot = []
+    ordered_dates_desc = [date for date, _ in reversed(daily_counts)]
+
+    for data in totals.values():
+        streak_days = 0
+        for date_str in ordered_dates_desc:
+            if data["days"].get(date_str, 0) > 0:
+                streak_days += 1
+            else:
+                break
+
+        hot.append({
+            "player_id": data["player_id"],
+            "name": data["name"],
+            "team_abbr": data["team_abbr"],
+            "total_hr": data["total_hr"],
+            "streak_days": streak_days,
+        })
+
+    hot.sort(key=lambda x: (-x["total_hr"], -x["streak_days"], x["name"]))
+    return hot[:top_n]
+
+
+def split_lines_into_chunks(header: str, lines: list[str], limit: int = 1900):
+    chunks = []
+    current = header
+
+    for line in lines:
+        addition = f"{line}\n"
+        if len(current) + len(addition) > limit:
+            chunks.append(current.rstrip())
+            current = addition
+        else:
+            current += addition
+
+    if current.strip():
+        chunks.append(current.rstrip())
+
+    return chunks
+
+
+async def post_daily_hr_recap(force: bool = False):
+    target_date = yesterday_str()
+
+    if not force and state.get("last_daily_recap_date") == target_date:
+        log.info("Daily recap already posted for %s", target_date)
+        return
+
+    channel = await client.fetch_channel(DISCORD_CHANNEL_ID)
+
+    try:
+        recap = await asyncio.to_thread(build_yesterday_recap, target_date)
+        hot_streaks = await asyncio.to_thread(build_hot_streaks)
+    except Exception as exc:
+        log.exception("Failed building daily recap: %s", exc)
+        return
+
+    games = recap["games"]
+    total_hr = recap["total_hr"]
+    unique_players = recap["unique_players"]
+
+    if not games:
+        await channel.send(f"💣 **Yesterday's HR Recap — {target_date}**\nNo home runs found.")
+        state["last_daily_recap_date"] = target_date
+        save_state()
+        return
+
+    header = (
+        f"💣 **Yesterday's HR Recap — {target_date}**\n"
+        f"Total HR: **{total_hr}** | Players: **{unique_players}**\n\n"
+    )
+
+    lines = []
+    for game in games:
+        lines.append(f"**{game['label']}**")
+        for hitter in game["hitters"]:
+            hr_count = hitter["hr_count"]
+            lines.append(f"• {hitter['name']} ({hitter['team_abbr']}) — {hr_count} HR")
+        lines.append("")
+
+    for chunk in split_lines_into_chunks(header, lines):
+        await channel.send(chunk)
+
+    if hot_streaks:
+        embed = discord.Embed(
+            title=f"🔥 Hot HR Streaks (Last {HOT_STREAK_DAYS} Days)",
+            color=discord.Color.gold(),
+            description="Top homer hitters heading into today",
+        )
+
+        for row in hot_streaks:
+            streak_text = f"{row['streak_days']} straight day" if row["streak_days"] == 1 else f"{row['streak_days']} straight days"
+            if row["streak_days"] == 0:
+                streak_text = "No current streak"
+            embed.add_field(
+                name=f"{row['name']} ({row['team_abbr']})",
+                value=f"{row['total_hr']} HR in last {HOT_STREAK_DAYS} days\n{streak_text}",
+                inline=False,
+            )
+
+        top_logo = team_logo(hot_streaks[0]["team_abbr"])
+        if top_logo:
+            embed.set_thumbnail(url=top_logo)
+
+        embed.set_footer(text=f"Updated daily at {DAILY_RECAP_HOUR}:00 {TIMEZONE}")
+        await channel.send(embed=embed)
+
+    state["last_daily_recap_date"] = target_date
+    save_state()
+    log.info("Daily recap posted for %s", target_date)
+
+
 async def loop():
     await client.wait_until_ready()
     channel = await client.fetch_channel(DISCORD_CHANNEL_ID)
@@ -442,12 +691,12 @@ async def loop():
             for game in games:
                 try:
                     await process_game(channel, game)
-                except Exception as e:
-                    print(f"Error processing game {game.get('gamePk')}: {e}")
+                except Exception as exc:
+                    log.warning("Error processing game %s: %s", game.get("gamePk"), exc)
                 await asyncio.sleep(1)
 
-        except Exception as e:
-            print("ERROR:", e)
+        except Exception as exc:
+            log.warning("Main loop error: %s", exc)
 
         save_state()
         await asyncio.sleep(POLL_SECONDS)
@@ -455,9 +704,49 @@ async def loop():
 
 @client.event
 async def on_ready():
-    print(f"Bot ready as {client.user}")
-    client.loop.create_task(loop())
+    global loop_task
+
+    log.info("Bot ready as %s", client.user)
+
+    if loop_task is None or loop_task.done():
+        loop_task = client.loop.create_task(loop())
+        log.info("Started live alert loop")
+
+    if not scheduler.running:
+        scheduler.add_job(
+            post_daily_hr_recap,
+            trigger="cron",
+            hour=DAILY_RECAP_HOUR,
+            minute=0,
+            id="daily_hr_recap",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.start()
+        log.info("Scheduled daily HR recap for %s:00 %s", DAILY_RECAP_HOUR, TIMEZONE)
 
 
-load_state()
-client.run(DISCORD_TOKEN)
+@client.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    content = message.content.strip().lower()
+
+    if content == "!yhr":
+        await message.channel.send("Building yesterday's HR recap...")
+        await post_daily_hr_recap(force=True)
+
+    elif content == "!ping":
+        await message.channel.send("pong")
+
+
+def main():
+    require_env()
+    load_state()
+    client.run(DISCORD_TOKEN)
+
+
+if __name__ == "__main__":
+    main()
