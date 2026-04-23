@@ -45,6 +45,8 @@ logging.basicConfig(
 log = logging.getLogger("mlb_hr_alert_bot")
 
 intents = discord.Intents.default()
+intents.messages = True
+intents.message_content = True
 client = discord.Client(intents=intents)
 
 state = {
