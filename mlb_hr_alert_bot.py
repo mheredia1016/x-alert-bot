@@ -9,19 +9,18 @@ from datetime import datetime, timedelta
 import discord
 import requests
 from zoneinfo import ZoneInfo
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "15"))
 TIMEZONE = os.getenv("TIMEZONE", "America/Chicago")
 
-# Daily recap settings
 DAILY_RECAP_HOUR = int(os.getenv("DAILY_RECAP_HOUR", "8"))
+DAILY_RECAP_MINUTE = int(os.getenv("DAILY_RECAP_MINUTE", "0"))
 HOT_STREAK_DAYS = int(os.getenv("HOT_STREAK_DAYS", "7"))
 HOT_STREAK_TOP_N = int(os.getenv("HOT_STREAK_TOP_N", "8"))
+ENABLE_BIRTHDAY_NARRATIVE = os.getenv("ENABLE_BIRTHDAY_NARRATIVE", "true").lower() == "true"
 
-# Tighter near-HR thresholds
 NEAR_HR_MIN_EV = float(os.getenv("NEAR_HR_MIN_EV", "102"))
 NEAR_HR_MIN_ANGLE = float(os.getenv("NEAR_HR_MIN_ANGLE", "22"))
 NEAR_HR_MAX_ANGLE = float(os.getenv("NEAR_HR_MAX_ANGLE", "38"))
@@ -32,10 +31,11 @@ STATE_FILE = Path("mlb_hr_alert_state.json")
 SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date}"
 LIVE_FEED_URL = "https://statsapi.mlb.com/api/v1.1/game/{gamePk}/feed/live"
 BOXSCORE_URL = "https://statsapi.mlb.com/api/v1/game/{gamePk}/boxscore"
+TEAM_ROSTER_URL = "https://statsapi.mlb.com/api/v1/teams/{teamId}/roster?rosterType=active"
+PEOPLE_URL = "https://statsapi.mlb.com/api/v1/people?personIds={personIds}"
 
 TZ = ZoneInfo(TIMEZONE)
 session = requests.Session()
-scheduler = AsyncIOScheduler(timezone=TZ)
 loop_task = None
 
 logging.basicConfig(
@@ -55,74 +55,27 @@ state = {
     "pending_near_hr_play_ids": [],
     "last_startup_date": None,
     "last_daily_recap_date": None,
+    "last_schedule_check_minute": None,
 }
 
 TEAM_COLORS = {
-    "AZ": 0xA71930,
-    "ATL": 0xCE1141,
-    "BAL": 0xDF4601,
-    "BOS": 0xBD3039,
-    "CHC": 0x0E3386,
-    "CWS": 0x27251F,
-    "CIN": 0xC6011F,
-    "CLE": 0xE31937,
-    "COL": 0x33006F,
-    "DET": 0x0C2340,
-    "HOU": 0xEB6E1F,
-    "KC": 0x004687,
-    "LAA": 0xBA0021,
-    "LAD": 0x005A9C,
-    "MIA": 0x00A3E0,
-    "MIL": 0x12284B,
-    "MIN": 0x002B5C,
-    "NYM": 0x002D72,
-    "NYY": 0x132448,
-    "ATH": 0x003831,
-    "OAK": 0x003831,
-    "PHI": 0xE81828,
-    "PIT": 0xFDB827,
-    "SD": 0x2F241D,
-    "SEA": 0x005C5C,
-    "SF": 0xFD5A1E,
-    "STL": 0xC41E3A,
-    "TB": 0x092C5C,
-    "TEX": 0x003278,
-    "TOR": 0x134A8E,
-    "WSH": 0xAB0003,
+    "AZ": 0xA71930, "ATL": 0xCE1141, "BAL": 0xDF4601, "BOS": 0xBD3039,
+    "CHC": 0x0E3386, "CWS": 0x27251F, "CIN": 0xC6011F, "CLE": 0xE31937,
+    "COL": 0x33006F, "DET": 0x0C2340, "HOU": 0xEB6E1F, "KC": 0x004687,
+    "LAA": 0xBA0021, "LAD": 0x005A9C, "MIA": 0x00A3E0, "MIL": 0x12284B,
+    "MIN": 0x002B5C, "NYM": 0x002D72, "NYY": 0x132448, "ATH": 0x003831,
+    "OAK": 0x003831, "PHI": 0xE81828, "PIT": 0xFDB827, "SD": 0x2F241D,
+    "SEA": 0x005C5C, "SF": 0xFD5A1E, "STL": 0xC41E3A, "TB": 0x092C5C,
+    "TEX": 0x003278, "TOR": 0x134A8E, "WSH": 0xAB0003,
 }
 
 TEAM_LOGO_SLUGS = {
-    "AZ": "ari",
-    "ATL": "atl",
-    "BAL": "bal",
-    "BOS": "bos",
-    "CHC": "chc",
-    "CWS": "chw",
-    "CIN": "cin",
-    "CLE": "cle",
-    "COL": "col",
-    "DET": "det",
-    "HOU": "hou",
-    "KC": "kc",
-    "LAA": "laa",
-    "LAD": "lad",
-    "MIA": "mia",
-    "MIL": "mil",
-    "MIN": "min",
-    "NYM": "nym",
-    "NYY": "nyy",
-    "ATH": "oak",
-    "OAK": "oak",
-    "PHI": "phi",
-    "PIT": "pit",
-    "SD": "sd",
-    "SEA": "sea",
-    "SF": "sf",
-    "STL": "stl",
-    "TB": "tb",
-    "TEX": "tex",
-    "TOR": "tor",
-    "WSH": "wsh",
+    "AZ": "ari", "ATL": "atl", "BAL": "bal", "BOS": "bos", "CHC": "chc",
+    "CWS": "chw", "CIN": "cin", "CLE": "cle", "COL": "col", "DET": "det",
+    "HOU": "hou", "KC": "kc", "LAA": "laa", "LAD": "lad", "MIA": "mia",
+    "MIL": "mil", "MIN": "min", "NYM": "nym", "NYY": "nyy", "ATH": "oak",
+    "OAK": "oak", "PHI": "phi", "PIT": "pit", "SD": "sd", "SEA": "sea",
+    "SF": "sf", "STL": "stl", "TB": "tb", "TEX": "tex", "TOR": "tor", "WSH": "wsh",
 }
 
 
@@ -146,6 +99,7 @@ def load_state():
     state.setdefault("pending_near_hr_play_ids", [])
     state.setdefault("last_startup_date", None)
     state.setdefault("last_daily_recap_date", None)
+    state.setdefault("last_schedule_check_minute", None)
 
 
 def save_state():
@@ -156,7 +110,7 @@ def save_state():
 
 
 def get_json(url: str) -> dict:
-    resp = session.get(url, timeout=20)
+    resp = session.get(url, timeout=25)
     resp.raise_for_status()
     return resp.json()
 
@@ -176,24 +130,18 @@ def yesterday_str() -> str:
 def game_label(game):
     away = game["away"]
     home = game["home"]
-
     away_name = away.get("name") or away.get("teamName") or away.get("abbreviation") or "Away"
     home_name = home.get("name") or home.get("teamName") or home.get("abbreviation") or "Home"
-
     return f"{away_name} @ {home_name}"
 
 
 def team_logo(team_abbr):
     slug = TEAM_LOGO_SLUGS.get(team_abbr)
-    if not slug:
-        return None
-    return f"https://a.espncdn.com/i/teamlogos/mlb/500/{slug}.png"
+    return f"https://a.espncdn.com/i/teamlogos/mlb/500/{slug}.png" if slug else None
 
 
 def player_headshot(player_id):
-    if not player_id:
-        return None
-    return f"https://img.mlbstatic.com/mlb-photos/image/upload/w_180/v1/people/{player_id}/headshot/67/current"
+    return f"https://img.mlbstatic.com/mlb-photos/image/upload/w_180/v1/people/{player_id}/headshot/67/current" if player_id else None
 
 
 def ordinal(n):
@@ -202,6 +150,18 @@ def ordinal(n):
     else:
         suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
     return f"{n}{suffix}"
+
+
+def age_on_date(birth_date_str: str, date_obj: datetime):
+    try:
+        birth = datetime.strptime(birth_date_str, "%Y-%m-%d")
+    except Exception:
+        return None
+
+    age = date_obj.year - birth.year
+    if (date_obj.month, date_obj.day) < (birth.month, birth.day):
+        age -= 1
+    return age
 
 
 def is_home_run(play):
@@ -243,38 +203,24 @@ def is_near_hr(play):
     if ev is None or la is None or dist is None:
         return False
 
-    return (
-        ev >= NEAR_HR_MIN_EV
-        and NEAR_HR_MIN_ANGLE <= la <= NEAR_HR_MAX_ANGLE
-        and dist >= NEAR_HR_MIN_DISTANCE
-    )
+    return ev >= NEAR_HR_MIN_EV and NEAR_HR_MIN_ANGLE <= la <= NEAR_HR_MAX_ANGLE and dist >= NEAR_HR_MIN_DISTANCE
 
 
 def player_hr_number_in_game(all_plays, current_play):
-    matchup = current_play.get("matchup", {}) or {}
-    batter = matchup.get("batter", {}) or {}
-    batter_id = batter.get("id")
-
+    batter_id = ((current_play.get("matchup") or {}).get("batter") or {}).get("id")
     if not batter_id:
         return None
 
-    current_at_bat = (current_play.get("about", {}) or {}).get("atBatIndex", -1)
-
+    current_at_bat = (current_play.get("about") or {}).get("atBatIndex", -1)
     hr_count = 0
-    for play in all_plays:
-        about = play.get("about", {}) or {}
-        at_bat = about.get("atBatIndex", -1)
 
+    for play in all_plays:
+        at_bat = (play.get("about") or {}).get("atBatIndex", -1)
         if at_bat > current_at_bat:
             continue
 
-        play_matchup = play.get("matchup", {}) or {}
-        play_batter = play_matchup.get("batter", {}) or {}
-
-        if play_batter.get("id") != batter_id:
-            continue
-
-        if is_home_run(play):
+        play_batter_id = ((play.get("matchup") or {}).get("batter") or {}).get("id")
+        if play_batter_id == batter_id and is_home_run(play):
             hr_count += 1
 
     return hr_count if hr_count > 0 else None
@@ -320,7 +266,6 @@ async def send_startup_message():
 async def send_alert(channel, game, play, alert_type, all_plays=None):
     result = play.get("result", {})
     matchup = play.get("matchup", {})
-
     batter = matchup.get("batter", {})
     pitcher = matchup.get("pitcher", {})
 
@@ -340,7 +285,6 @@ async def send_alert(channel, game, play, alert_type, all_plays=None):
 
     color_value = TEAM_COLORS.get(team_abbr, 0x1D428A)
     color = discord.Color.orange() if alert_type == "near" else discord.Color(color_value)
-
     title = "💣 Home Run" if alert_type == "hr" else "⚠️ Near Home Run"
 
     hr_number_text = None
@@ -375,7 +319,6 @@ async def send_alert(channel, game, play, alert_type, all_plays=None):
             parts.append(f'LA {metrics["launchAngle"]}')
         if metrics.get("totalDistance") is not None:
             parts.append(f'{metrics["totalDistance"]} ft')
-
         if parts:
             embed.add_field(name="Contact", value=" | ".join(parts), inline=False)
 
@@ -388,7 +331,6 @@ async def send_alert(channel, game, play, alert_type, all_plays=None):
         embed.set_image(url=headshot_url)
 
     embed.set_footer(text="MLB live feed")
-
     await channel.send(embed=embed)
 
 
@@ -515,21 +457,13 @@ def build_yesterday_recap(target_date: str):
             continue
 
         hitters.sort(key=lambda x: (-x["hr_count"], x["name"]))
-        recap_games.append({
-            "label": game_label(game),
-            "hitters": hitters,
-        })
+        recap_games.append({"label": game_label(game), "hitters": hitters})
 
         for hitter in hitters:
             total_hr += hitter["hr_count"]
             unique_players.add(hitter["name"])
 
-    return {
-        "date": target_date,
-        "games": recap_games,
-        "total_hr": total_hr,
-        "unique_players": len(unique_players),
-    }
+    return {"date": target_date, "games": recap_games, "total_hr": total_hr, "unique_players": len(unique_players)}
 
 
 def build_hot_streaks(end_date_days_ago: int = 1, window_days: int = HOT_STREAK_DAYS, top_n: int = HOT_STREAK_TOP_N):
@@ -592,6 +526,85 @@ def build_hot_streaks(end_date_days_ago: int = 1, window_days: int = HOT_STREAK_
     return hot[:top_n]
 
 
+def get_active_roster_player_ids(team_id: int):
+    data = get_json(TEAM_ROSTER_URL.format(teamId=team_id))
+    return [
+        row.get("person", {}).get("id")
+        for row in data.get("roster", [])
+        if row.get("person", {}).get("id")
+    ]
+
+
+def get_people_by_ids(player_ids):
+    people = []
+    chunk_size = 100
+
+    for i in range(0, len(player_ids), chunk_size):
+        chunk = player_ids[i:i + chunk_size]
+        ids = ",".join(str(x) for x in chunk)
+        data = get_json(PEOPLE_URL.format(personIds=ids))
+        people.extend(data.get("people", []))
+
+    return people
+
+
+def build_birthday_narratives(today_games, hot_streaks):
+    if not ENABLE_BIRTHDAY_NARRATIVE:
+        return []
+
+    today = datetime.now(TZ)
+    today_mmdd = today.strftime("%m-%d")
+    hot_lookup = {row["player_id"]: row for row in hot_streaks if row.get("player_id")}
+
+    team_games = {}
+    team_ids = set()
+
+    for game in today_games:
+        for team in (game.get("away") or {}, game.get("home") or {}):
+            team_id = team.get("id")
+            if not team_id:
+                continue
+
+            team_ids.add(team_id)
+            team_games[team_id] = {
+                "team_abbr": team.get("abbreviation") or team.get("teamName") or team.get("name") or "MLB",
+                "game": game_label(game),
+            }
+
+    birthday_players = []
+
+    for team_id in sorted(team_ids):
+        try:
+            roster_ids = get_active_roster_player_ids(team_id)
+            people = get_people_by_ids(roster_ids)
+        except Exception as exc:
+            log.warning("Could not load birthday data for team %s: %s", team_id, exc)
+            continue
+
+        for person in people:
+            birth_date = person.get("birthDate")
+            if not birth_date or birth_date[5:] != today_mmdd:
+                continue
+
+            player_id = person.get("id")
+            hot = hot_lookup.get(player_id)
+            team_info = team_games.get(team_id, {})
+
+            birthday_players.append({
+                "player_id": player_id,
+                "name": person.get("fullName", "Unknown"),
+                "birth_date": birth_date,
+                "age": age_on_date(birth_date, today),
+                "team_abbr": team_info.get("team_abbr", "MLB"),
+                "game": team_info.get("game", "Team plays today"),
+                "last_7_hr": hot.get("total_hr", 0) if hot else 0,
+                "streak_days": hot.get("streak_days", 0) if hot else 0,
+            })
+
+    birthday_players.sort(key=lambda x: (x["team_abbr"], x["name"]))
+    return birthday_players
+
+
 def split_lines_into_chunks(header: str, lines: list[str], limit: int = 1900):
     chunks = []
     current = header
@@ -610,6 +623,39 @@ def split_lines_into_chunks(header: str, lines: list[str], limit: int = 1900):
     return chunks
 
 
+async def send_birthday_embed(channel, birthday_narratives):
+    if not birthday_narratives:
+        await channel.send("🎂 **Birthday Narrative Watch**\nNo active roster birthday matches found for teams playing today.")
+        return
+
+    embed = discord.Embed(
+        title="🎂 Birthday Narrative Watch",
+        color=discord.Color.magenta(),
+        description="Active roster players with birthdays today whose team plays today",
+    )
+
+    for player in birthday_narratives[:10]:
+        age_text = f"turns {player['age']} today" if player["age"] else "birthday today"
+        streak_text = ""
+        if player["last_7_hr"] > 0:
+            streak_text = f"\n{player['last_7_hr']} HR in last {HOT_STREAK_DAYS} days"
+            if player["streak_days"] > 0:
+                streak_text += f" | {player['streak_days']} straight-day streak"
+
+        embed.add_field(
+            name=f"{player['name']} ({player['team_abbr']})",
+            value=f"{age_text}\n{player['game']}{streak_text}",
+            inline=False,
+        )
+
+    headshot = player_headshot(birthday_narratives[0].get("player_id"))
+    if headshot:
+        embed.set_thumbnail(url=headshot)
+
+    embed.set_footer(text="Birthday note means active roster + team has a game today; lineup not guaranteed.")
+    await channel.send(embed=embed)
+
+
 async def post_daily_hr_recap(force: bool = False):
     target_date = yesterday_str()
 
@@ -622,35 +668,31 @@ async def post_daily_hr_recap(force: bool = False):
     try:
         recap = await asyncio.to_thread(build_yesterday_recap, target_date)
         hot_streaks = await asyncio.to_thread(build_hot_streaks)
+        today_games = await asyncio.to_thread(get_today_games)
+        birthday_narratives = await asyncio.to_thread(build_birthday_narratives, today_games, hot_streaks)
     except Exception as exc:
         log.exception("Failed building daily recap: %s", exc)
         return
 
     games = recap["games"]
-    total_hr = recap["total_hr"]
-    unique_players = recap["unique_players"]
 
     if not games:
         await channel.send(f"💣 **Yesterday's HR Recap — {target_date}**\nNo home runs found.")
-        state["last_daily_recap_date"] = target_date
-        save_state()
-        return
+    else:
+        header = (
+            f"💣 **Yesterday's HR Recap — {target_date}**\n"
+            f"Total HR: **{recap['total_hr']}** | Players: **{recap['unique_players']}**\n\n"
+        )
 
-    header = (
-        f"💣 **Yesterday's HR Recap — {target_date}**\n"
-        f"Total HR: **{total_hr}** | Players: **{unique_players}**\n\n"
-    )
+        lines = []
+        for game in games:
+            lines.append(f"**{game['label']}**")
+            for hitter in game["hitters"]:
+                lines.append(f"• {hitter['name']} ({hitter['team_abbr']}) — {hitter['hr_count']} HR")
+            lines.append("")
 
-    lines = []
-    for game in games:
-        lines.append(f"**{game['label']}**")
-        for hitter in game["hitters"]:
-            hr_count = hitter["hr_count"]
-            lines.append(f"• {hitter['name']} ({hitter['team_abbr']}) — {hr_count} HR")
-        lines.append("")
-
-    for chunk in split_lines_into_chunks(header, lines):
-        await channel.send(chunk)
+        for chunk in split_lines_into_chunks(header, lines):
+            await channel.send(chunk)
 
     if hot_streaks:
         embed = discord.Embed(
@@ -663,6 +705,7 @@ async def post_daily_hr_recap(force: bool = False):
             streak_text = f"{row['streak_days']} straight day" if row["streak_days"] == 1 else f"{row['streak_days']} straight days"
             if row["streak_days"] == 0:
                 streak_text = "No current streak"
+
             embed.add_field(
                 name=f"{row['name']} ({row['team_abbr']})",
                 value=f"{row['total_hr']} HR in last {HOT_STREAK_DAYS} days\n{streak_text}",
@@ -673,12 +716,29 @@ async def post_daily_hr_recap(force: bool = False):
         if top_logo:
             embed.set_thumbnail(url=top_logo)
 
-        embed.set_footer(text=f"Updated daily at {DAILY_RECAP_HOUR}:00 {TIMEZONE}")
+        embed.set_footer(text=f"Updated daily at {DAILY_RECAP_HOUR}:{DAILY_RECAP_MINUTE:02d} {TIMEZONE}")
         await channel.send(embed=embed)
+
+    await send_birthday_embed(channel, birthday_narratives)
 
     state["last_daily_recap_date"] = target_date
     save_state()
     log.info("Daily recap posted for %s", target_date)
+
+
+async def maybe_run_scheduled_daily_recap():
+    now = datetime.now(TZ)
+    schedule_key = now.strftime("%Y-%m-%d-%H-%M")
+
+    if (
+        now.hour == DAILY_RECAP_HOUR
+        and now.minute == DAILY_RECAP_MINUTE
+        and state.get("last_schedule_check_minute") != schedule_key
+    ):
+        state["last_schedule_check_minute"] = schedule_key
+        save_state()
+        log.info("Scheduled daily recap trigger fired at %s", now.isoformat())
+        await post_daily_hr_recap(force=False)
 
 
 async def loop():
@@ -688,8 +748,9 @@ async def loop():
 
     while True:
         try:
-            games = get_today_games()
+            await maybe_run_scheduled_daily_recap()
 
+            games = get_today_games()
             for game in games:
                 try:
                     await process_game(channel, game)
@@ -709,24 +770,13 @@ async def on_ready():
     global loop_task
 
     log.info("Bot ready as %s", client.user)
+    log.info("Schedule set for %s:%02d %s", DAILY_RECAP_HOUR, DAILY_RECAP_MINUTE, TIMEZONE)
 
     if loop_task is None or loop_task.done():
         loop_task = client.loop.create_task(loop())
         log.info("Started live alert loop")
-
-    if not scheduler.running:
-        scheduler.add_job(
-            post_daily_hr_recap,
-            trigger="cron",
-            hour=DAILY_RECAP_HOUR,
-            minute=0,
-            id="daily_hr_recap",
-            replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-        )
-        scheduler.start()
-        log.info("Scheduled daily HR recap for %s:00 %s", DAILY_RECAP_HOUR, TIMEZONE)
+    else:
+        log.info("Live alert loop already running")
 
 
 @client.event
@@ -739,6 +789,19 @@ async def on_message(message):
     if content == "!yhr":
         await message.channel.send("Building yesterday's HR recap...")
         await post_daily_hr_recap(force=True)
+
+    elif content == "!bday":
+        await message.channel.send("Checking today's birthday narrative...")
+        try:
+            hot_streaks = await asyncio.to_thread(build_hot_streaks)
+            today_games = await asyncio.to_thread(get_today_games)
+            birthday_narratives = await asyncio.to_thread(build_birthday_narratives, today_games, hot_streaks)
+        except Exception as exc:
+            log.exception("Birthday command failed: %s", exc)
+            await message.channel.send("Could not load birthday data right now.")
+            return
+
+        await send_birthday_embed(message.channel, birthday_narratives)
 
     elif content == "!ping":
         await message.channel.send("pong")
