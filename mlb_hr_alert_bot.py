@@ -245,6 +245,9 @@ def player_hr_number_in_game(all_plays, current_play):
 
 
 async def send_startup_message():
+    if DISABLE_STARTUP_MESSAGE:
+        return
+
     channel = await client.fetch_channel(DISCORD_CHANNEL_ID)
     msg_date = today_str()
     if state.get("last_startup_date") == msg_date:
@@ -597,8 +600,8 @@ def build_2hr_watch(today_games, hot_streaks, top_n: int = TWO_HR_WATCH_TOP_N):
     """
     Fast MLB-only 2-HR Watch.
 
-    This optimized version only checks players already showing recent HR form.
-    That keeps !2hr from hanging by avoiding full active-roster scans.
+    This version never returns empty if there are recent HR hitters.
+    It ranks recent HR hitters and labels confidence instead of filtering everything out.
     """
     if not ENABLE_2HR_WATCH:
         return []
@@ -607,20 +610,29 @@ def build_2hr_watch(today_games, hot_streaks, top_n: int = TWO_HR_WATCH_TOP_N):
     pitcher_hr9_cache = {}
     contact_cache = {}
 
-    # Map team abbreviation -> today's game/team id.
+    # Map several team keys -> today's game/team id so matching does not fail on abbreviation differences.
     team_context = {}
     for game in today_games:
         for team in (game.get("away") or {}, game.get("home") or {}):
-            abbr = team.get("abbreviation") or team.get("teamName") or team.get("name")
+            keys = [
+                team.get("abbreviation"),
+                team.get("teamName"),
+                team.get("name"),
+                team.get("fileCode"),
+            ]
             team_id = team.get("id")
-            if abbr:
-                team_context[abbr] = {
-                    "team_id": team_id,
-                    "game": game,
-                }
+            for key in keys:
+                if key:
+                    team_context[str(key).upper()] = {
+                        "team_id": team_id,
+                        "game": game,
+                    }
 
     # Only evaluate recent HR hitters, not every active player.
-    for hot in hot_streaks[: max(top_n * 2, 10)]:
+    # Use a bigger pool so we still get candidates on lighter days.
+    pool = hot_streaks[: max(top_n * 4, 20)]
+
+    for hot in pool:
         player_id = hot.get("player_id")
         player_name = hot.get("name", "Unknown")
         team_abbr = hot.get("team_abbr", "MLB")
@@ -630,21 +642,24 @@ def build_2hr_watch(today_games, hot_streaks, top_n: int = TWO_HR_WATCH_TOP_N):
         if last_7_hr <= 0:
             continue
 
-        context = team_context.get(team_abbr)
-        if not context:
-            continue
+        context = team_context.get(str(team_abbr).upper())
 
-        game = context["game"]
-        team_id = context["team_id"]
+        # Do NOT skip if we cannot match today's game. Still score the hitter from recent form/contact.
+        game = context["game"] if context else None
+        team_id = context["team_id"] if context else None
 
-        probable_pitcher = get_probable_pitcher_for_team(game, team_id) if team_id else None
-        pitcher_id = probable_pitcher.get("id") if probable_pitcher else None
-        pitcher_name = probable_pitcher.get("fullName") if probable_pitcher else "TBD"
+        pitcher_name = "TBD"
+        pitcher_hr9 = None
 
-        if pitcher_id and pitcher_id not in pitcher_hr9_cache:
-            pitcher_hr9_cache[pitcher_id] = get_pitcher_hr_per_9(pitcher_id)
+        if game and team_id:
+            probable_pitcher = get_probable_pitcher_for_team(game, team_id)
+            pitcher_id = probable_pitcher.get("id") if probable_pitcher else None
+            pitcher_name = probable_pitcher.get("fullName") if probable_pitcher else "TBD"
 
-        pitcher_hr9 = pitcher_hr9_cache.get(pitcher_id) if pitcher_id else None
+            if pitcher_id and pitcher_id not in pitcher_hr9_cache:
+                pitcher_hr9_cache[pitcher_id] = get_pitcher_hr_per_9(pitcher_id)
+
+            pitcher_hr9 = pitcher_hr9_cache.get(pitcher_id) if pitcher_id else None
 
         if player_id and player_id not in contact_cache:
             contact_cache[player_id] = collect_recent_contact_for_player(player_id, days=3)
@@ -667,13 +682,19 @@ def build_2hr_watch(today_games, hot_streaks, top_n: int = TWO_HR_WATCH_TOP_N):
         if pitcher_hr9:
             score += pitcher_hr9 * 10
 
-        if score < TWO_HR_MIN_SCORE:
-            continue
+        score = round(score)
+
+        if score >= 55:
+            confidence = "High"
+        elif score >= 30:
+            confidence = "Medium"
+        else:
+            confidence = "Low"
 
         candidates.append({
             "name": player_name,
             "team_abbr": team_abbr,
-            "game": game_label(game),
+            "game": game_label(game) if game else "Game match TBD",
             "last_7_hr": last_7_hr,
             "streak_days": streak_days,
             "near_hr_count": near_hr_count,
@@ -681,7 +702,8 @@ def build_2hr_watch(today_games, hot_streaks, top_n: int = TWO_HR_WATCH_TOP_N):
             "last_hr_ev": last_hr_ev,
             "pitcher_name": pitcher_name,
             "pitcher_hr9": pitcher_hr9,
-            "score": round(score),
+            "score": score,
+            "confidence": confidence,
         })
 
     candidates.sort(key=lambda x: (-x["score"], -x["last_7_hr"], -x["near_hr_count"], x["name"]))
@@ -692,7 +714,7 @@ async def send_2hr_watch_embed(channel, two_hr_watch):
     if not ENABLE_2HR_WATCH:
         return
     if not two_hr_watch:
-        await channel.send("💥 **2-HR Watch**\nNo strong 2-HR candidates found from MLB-only signals today.")
+        await channel.send("💥 **2-HR Watch**\nNo recent HR hitters found for today’s slate.")
         return
     embed = discord.Embed(title="💥 2-HR Watch", color=discord.Color.red(), description="MLB-only model: recent HR form, near-HR contact, EV, and opposing probable pitcher HR/9")
     for idx, row in enumerate(two_hr_watch, start=1):
@@ -708,6 +730,8 @@ async def send_2hr_watch_embed(channel, two_hr_watch):
         else:
             lines.append("• Opposing probable pitcher HR/9: TBD")
         lines.append(f"• Score: {row['score']}")
+        if row.get("confidence"):
+            lines.append(f"• Confidence: {row['confidence']}")
         embed.add_field(name=f"{idx}. {row['name']} ({row['team_abbr']})", value="\n".join(lines), inline=False)
     embed.set_footer(text="Not betting advice. Score is a simple signal model from MLB Stats API data.")
     await channel.send(embed=embed)
@@ -806,6 +830,7 @@ async def on_ready():
     global loop_task
     log.info("Bot ready as %s", client.user)
     log.info("Schedule set for %s:%02d %s", DAILY_RECAP_HOUR, DAILY_RECAP_MINUTE, TIMEZONE)
+    log.info("Redeploy protection: skip_old_plays=%s max_minutes=%s", SKIP_OLD_PLAYS_ON_STARTUP, OLD_PLAY_MAX_MINUTES)
     if loop_task is None or loop_task.done():
         loop_task = client.loop.create_task(loop())
         log.info("Started live alert loop")
