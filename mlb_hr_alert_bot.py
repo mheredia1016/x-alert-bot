@@ -815,6 +815,26 @@ async def send_birthday_embed(channel, birthday_narratives):
     await channel.send(embed=embed)
 
 
+
+def split_lines_into_chunks(header: str, lines: list[str], limit: int = 1900):
+    chunks = []
+    current = header
+
+    for line in lines:
+        addition = f"{line}\n"
+
+        if len(current) + len(addition) > limit:
+            chunks.append(current.rstrip())
+            current = addition
+        else:
+            current += addition
+
+    if current.strip():
+        chunks.append(current.rstrip())
+
+    return chunks
+
+
 async def post_daily_hr_recap(force=False):
     target_date = yesterday_str()
 
