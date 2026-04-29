@@ -19,6 +19,9 @@ DAILY_RECAP_HOUR = int(os.getenv("DAILY_RECAP_HOUR", "8"))
 DAILY_RECAP_MINUTE = int(os.getenv("DAILY_RECAP_MINUTE", "0"))
 HOT_STREAK_DAYS = int(os.getenv("HOT_STREAK_DAYS", "7"))
 HOT_STREAK_TOP_N = int(os.getenv("HOT_STREAK_TOP_N", "8"))
+TWO_HR_WATCH_TOP_N = int(os.getenv("TWO_HR_WATCH_TOP_N", "6"))
+TWO_HR_MIN_SCORE = float(os.getenv("TWO_HR_MIN_SCORE", "35"))
+ENABLE_2HR_WATCH = os.getenv("ENABLE_2HR_WATCH", "true").lower() == "true"
 ENABLE_BIRTHDAY_NARRATIVE = os.getenv("ENABLE_BIRTHDAY_NARRATIVE", "true").lower() == "true"
 
 NEAR_HR_MIN_EV = float(os.getenv("NEAR_HR_MIN_EV", "102"))
@@ -33,6 +36,7 @@ LIVE_FEED_URL = "https://statsapi.mlb.com/api/v1.1/game/{gamePk}/feed/live"
 BOXSCORE_URL = "https://statsapi.mlb.com/api/v1/game/{gamePk}/boxscore"
 TEAM_ROSTER_URL = "https://statsapi.mlb.com/api/v1/teams/{teamId}/roster?rosterType=active"
 PEOPLE_URL = "https://statsapi.mlb.com/api/v1/people?personIds={personIds}"
+PITCHER_STATS_URL = "https://statsapi.mlb.com/api/v1/people/{personId}/stats?stats=season&group=pitching&season={season}"
 
 TZ = ZoneInfo(TIMEZONE)
 session = requests.Session()
@@ -526,6 +530,286 @@ def build_hot_streaks(end_date_days_ago: int = 1, window_days: int = HOT_STREAK_
     return hot[:top_n]
 
 
+
+def get_current_season() -> str:
+    return datetime.now(TZ).strftime("%Y")
+
+
+def safe_float(value, default=0.0):
+    try:
+        if value in (None, "", "-.--"):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def get_probable_pitcher_for_team(game: dict, batter_team_id: int):
+    """
+    Returns the opposing probable pitcher for the batter's team.
+    MLB schedule data often includes probablePitcher when announced.
+    """
+    try:
+        raw_schedule = get_json(SCHEDULE_URL.format(date=today_str()))
+        raw_game = None
+
+        for date_block in raw_schedule.get("dates", []):
+            for g in date_block.get("games", []):
+                if g.get("gamePk") == game.get("gamePk"):
+                    raw_game = g
+                    break
+            if raw_game:
+                break
+
+        if not raw_game:
+            return None
+
+        teams = raw_game.get("teams") or {}
+        away = teams.get("away") or {}
+        home = teams.get("home") or {}
+
+        away_id = ((away.get("team") or {}).get("id"))
+        home_id = ((home.get("team") or {}).get("id"))
+
+        if batter_team_id == away_id:
+            return home.get("probablePitcher")
+        if batter_team_id == home_id:
+            return away.get("probablePitcher")
+
+    except Exception as exc:
+        log.warning("Could not load probable pitcher for game %s: %s", game.get("gamePk"), exc)
+
+    return None
+
+
+def get_pitcher_hr_per_9(pitcher_id: int):
+    if not pitcher_id:
+        return None
+
+    try:
+        data = get_json(PITCHER_STATS_URL.format(personId=pitcher_id, season=get_current_season()))
+        stats = data.get("stats") or []
+        if not stats:
+            return None
+
+        splits = stats[0].get("splits") or []
+        if not splits:
+            return None
+
+        stat = splits[0].get("stat") or {}
+        hr_allowed = safe_float(stat.get("homeRuns"), 0.0)
+        innings = safe_float(stat.get("inningsPitched"), 0.0)
+
+        if innings <= 0:
+            return None
+
+        return round((hr_allowed / innings) * 9, 2)
+
+    except Exception as exc:
+        log.warning("Could not load pitcher HR/9 for %s: %s", pitcher_id, exc)
+        return None
+
+
+def collect_recent_contact_for_player(player_id: int, days: int = 3):
+    """
+    Pulls recent game feeds and calculates:
+    - near-HR balls
+    - max EV
+    - last HR EV
+    Uses the same hitData fields as the live alerts.
+    """
+    if not player_id:
+        return {"near_hr_count": 0, "max_ev": None, "last_hr_ev": None}
+
+    near_hr_count = 0
+    max_ev = None
+    last_hr_ev = None
+
+    for days_ago in range(days, 0, -1):
+        date_str = day_str(days_ago)
+
+        try:
+            games = get_games_for_date(date_str)
+        except Exception:
+            continue
+
+        for game in games:
+            game_pk = game.get("gamePk")
+            if not game_pk:
+                continue
+
+            try:
+                data = get_json(LIVE_FEED_URL.format(gamePk=game_pk))
+                plays = (((data.get("liveData") or {}).get("plays") or {}).get("allPlays") or [])
+            except Exception:
+                continue
+
+            for play in plays:
+                batter_id = (((play.get("matchup") or {}).get("batter") or {}).get("id"))
+                if batter_id != player_id:
+                    continue
+
+                metrics = get_metrics(play)
+                if metrics:
+                    ev = metrics.get("launchSpeed")
+                    if ev is not None:
+                        max_ev = ev if max_ev is None else max(max_ev, ev)
+
+                if is_near_hr(play):
+                    near_hr_count += 1
+
+                if is_home_run(play) and metrics and metrics.get("launchSpeed") is not None:
+                    last_hr_ev = metrics.get("launchSpeed")
+
+    return {
+        "near_hr_count": near_hr_count,
+        "max_ev": max_ev,
+        "last_hr_ev": last_hr_ev,
+    }
+
+
+def active_roster_players_for_team(team_id: int, team_abbr: str):
+    try:
+        roster_ids = get_active_roster_player_ids(team_id)
+        people = get_people_by_ids(roster_ids)
+    except Exception as exc:
+        log.warning("Could not load active roster for 2HR watch team %s: %s", team_id, exc)
+        return []
+
+    players = []
+    for person in people:
+        players.append({
+            "player_id": person.get("id"),
+            "name": person.get("fullName", "Unknown"),
+            "team_id": team_id,
+            "team_abbr": team_abbr,
+        })
+
+    return players
+
+
+def build_2hr_watch(today_games: list[dict], hot_streaks: list[dict], top_n: int = TWO_HR_WATCH_TOP_N):
+    """
+    MLB-only 2-HR watch.
+    Uses:
+    - last 7 HR from hot streaks
+    - near-HR balls last 3 days
+    - last HR EV / max recent EV
+    - opposing probable pitcher HR/9, when available
+    """
+    if not ENABLE_2HR_WATCH:
+        return []
+
+    hot_lookup = {row["player_id"]: row for row in hot_streaks if row.get("player_id")}
+    candidates = []
+
+    for game in today_games:
+        for team in (game.get("away") or {}, game.get("home") or {}):
+            team_id = team.get("id")
+            team_abbr = team.get("abbreviation") or team.get("teamName") or team.get("name") or "MLB"
+            if not team_id:
+                continue
+
+            players = active_roster_players_for_team(team_id, team_abbr)
+            probable_pitcher = get_probable_pitcher_for_team(game, team_id)
+            pitcher_id = probable_pitcher.get("id") if probable_pitcher else None
+            pitcher_name = probable_pitcher.get("fullName") if probable_pitcher else "TBD"
+            pitcher_hr9 = get_pitcher_hr_per_9(pitcher_id) if pitcher_id else None
+
+            for player in players:
+                player_id = player.get("player_id")
+                hot = hot_lookup.get(player_id, {
+                    "total_hr": 0,
+                    "streak_days": 0,
+                    "team_abbr": team_abbr,
+                    "name": player["name"],
+                    "player_id": player_id,
+                })
+
+                contact = collect_recent_contact_for_player(player_id, days=3)
+
+                last_7_hr = int(hot.get("total_hr", 0) or 0)
+                streak_days = int(hot.get("streak_days", 0) or 0)
+                near_hr_count = int(contact.get("near_hr_count", 0) or 0)
+                max_ev = contact.get("max_ev")
+                last_hr_ev = contact.get("last_hr_ev")
+
+                score = 0
+                score += last_7_hr * 12
+                score += streak_days * 7
+                score += near_hr_count * 8
+
+                if last_hr_ev:
+                    score += max(0, last_hr_ev - 95) * 0.8
+                elif max_ev:
+                    score += max(0, max_ev - 98) * 0.5
+
+                if pitcher_hr9:
+                    score += pitcher_hr9 * 10
+
+                if score < TWO_HR_MIN_SCORE:
+                    continue
+
+                candidates.append({
+                    "name": player["name"],
+                    "team_abbr": team_abbr,
+                    "game": game_label(game),
+                    "last_7_hr": last_7_hr,
+                    "streak_days": streak_days,
+                    "near_hr_count": near_hr_count,
+                    "max_ev": max_ev,
+                    "last_hr_ev": last_hr_ev,
+                    "pitcher_name": pitcher_name,
+                    "pitcher_hr9": pitcher_hr9,
+                    "score": round(score),
+                })
+
+    candidates.sort(key=lambda x: (-x["score"], -x["last_7_hr"], -x["near_hr_count"], x["name"]))
+    return candidates[:top_n]
+
+
+async def send_2hr_watch_embed(channel, two_hr_watch):
+    if not ENABLE_2HR_WATCH:
+        return
+
+    if not two_hr_watch:
+        await channel.send("💥 **2-HR Watch**\nNo strong 2-HR candidates found from MLB-only signals today.")
+        return
+
+    embed = discord.Embed(
+        title="💥 2-HR Watch",
+        color=discord.Color.red(),
+        description="MLB-only model: recent HR form, near-HR contact, EV, and opposing probable pitcher HR/9",
+    )
+
+    for idx, row in enumerate(two_hr_watch, start=1):
+        lines = []
+        lines.append(f"• {row['last_7_hr']} HR last {HOT_STREAK_DAYS} days")
+
+        if row["near_hr_count"] > 0:
+            lines.append(f"• {row['near_hr_count']} near-HR balls last 3 games")
+
+        if row["last_hr_ev"]:
+            lines.append(f"• {row['last_hr_ev']:.1f} EV last HR")
+        elif row["max_ev"]:
+            lines.append(f"• {row['max_ev']:.1f} max EV last 3 games")
+
+        if row["pitcher_hr9"] is not None:
+            lines.append(f"• Faces {row['pitcher_name']} allowing {row['pitcher_hr9']} HR/9")
+        else:
+            lines.append("• Opposing probable pitcher HR/9: TBD")
+
+        lines.append(f"• Score: {row['score']}")
+
+        embed.add_field(
+            name=f"{idx}. {row['name']} ({row['team_abbr']})",
+            value="\n".join(lines),
+            inline=False,
+        )
+
+    embed.set_footer(text="Not betting advice. Score is a simple signal model from MLB Stats API data.")
+    await channel.send(embed=embed)
+
 def get_active_roster_player_ids(team_id: int):
     data = get_json(TEAM_ROSTER_URL.format(teamId=team_id))
     return [
@@ -670,6 +954,7 @@ async def post_daily_hr_recap(force: bool = False):
         hot_streaks = await asyncio.to_thread(build_hot_streaks)
         today_games = await asyncio.to_thread(get_today_games)
         birthday_narratives = await asyncio.to_thread(build_birthday_narratives, today_games, hot_streaks)
+        two_hr_watch = await asyncio.to_thread(build_2hr_watch, today_games, hot_streaks)
     except Exception as exc:
         log.exception("Failed building daily recap: %s", exc)
         return
@@ -718,6 +1003,8 @@ async def post_daily_hr_recap(force: bool = False):
 
         embed.set_footer(text=f"Updated daily at {DAILY_RECAP_HOUR}:{DAILY_RECAP_MINUTE:02d} {TIMEZONE}")
         await channel.send(embed=embed)
+
+    await send_2hr_watch_embed(channel, two_hr_watch)
 
     await send_birthday_embed(channel, birthday_narratives)
 
@@ -796,12 +1083,26 @@ async def on_message(message):
             hot_streaks = await asyncio.to_thread(build_hot_streaks)
             today_games = await asyncio.to_thread(get_today_games)
             birthday_narratives = await asyncio.to_thread(build_birthday_narratives, today_games, hot_streaks)
+        two_hr_watch = await asyncio.to_thread(build_2hr_watch, today_games, hot_streaks)
         except Exception as exc:
             log.exception("Birthday command failed: %s", exc)
             await message.channel.send("Could not load birthday data right now.")
             return
 
         await send_birthday_embed(message.channel, birthday_narratives)
+
+    elif content == "!2hr":
+        await message.channel.send("Building 2-HR Watch...")
+        try:
+            hot_streaks = await asyncio.to_thread(build_hot_streaks)
+            today_games = await asyncio.to_thread(get_today_games)
+            two_hr_watch = await asyncio.to_thread(build_2hr_watch, today_games, hot_streaks)
+        except Exception as exc:
+            log.exception("2HR command failed: %s", exc)
+            await message.channel.send("Could not build 2-HR Watch right now.")
+            return
+
+        await send_2hr_watch_embed(message.channel, two_hr_watch)
 
     elif content == "!ping":
         await message.channel.send("pong")
