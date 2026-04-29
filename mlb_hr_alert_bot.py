@@ -596,21 +596,76 @@ def active_roster_players_for_team(team_id, team_abbr):
     return [{"player_id": p.get("id"), "name": p.get("fullName", "Unknown"), "team_id": team_id, "team_abbr": team_abbr} for p in people]
 
 
+
+def collect_recent_contact_for_players(player_ids, days: int = 3):
+    """
+    Fast batch version. Fetches each recent game feed once, then records contact
+    only for candidate player IDs. This prevents !yhr / !2hr from hanging.
+    """
+    wanted = {pid for pid in player_ids if pid}
+    results = {
+        pid: {"near_hr_count": 0, "max_ev": None, "last_hr_ev": None}
+        for pid in wanted
+    }
+
+    if not wanted:
+        return results
+
+    for days_ago in range(days, 0, -1):
+        date_str = day_str(days_ago)
+
+        try:
+            games = get_games_for_date(date_str)
+        except Exception as exc:
+            log.warning("Could not load games for contact date %s: %s", date_str, exc)
+            continue
+
+        for game in games:
+            game_pk = game.get("gamePk")
+            if not game_pk:
+                continue
+
+            try:
+                data = get_json(LIVE_FEED_URL.format(gamePk=game_pk))
+                plays = (((data.get("liveData") or {}).get("plays") or {}).get("allPlays") or [])
+            except Exception as exc:
+                log.warning("Could not load feed for contact game %s: %s", game_pk, exc)
+                continue
+
+            for play in plays:
+                batter_id = (((play.get("matchup") or {}).get("batter") or {}).get("id"))
+                if batter_id not in wanted:
+                    continue
+
+                row = results.setdefault(batter_id, {"near_hr_count": 0, "max_ev": None, "last_hr_ev": None})
+                metrics = get_metrics(play)
+
+                if metrics:
+                    ev = metrics.get("launchSpeed")
+                    if ev is not None:
+                        row["max_ev"] = ev if row["max_ev"] is None else max(row["max_ev"], ev)
+
+                if is_near_hr(play):
+                    row["near_hr_count"] += 1
+
+                if is_home_run(play) and metrics and metrics.get("launchSpeed") is not None:
+                    row["last_hr_ev"] = metrics.get("launchSpeed")
+
+    return results
+
+
 def build_2hr_watch(today_games, hot_streaks, top_n: int = TWO_HR_WATCH_TOP_N):
     """
     Fast MLB-only 2-HR Watch.
-
-    This version never returns empty if there are recent HR hitters.
-    It ranks recent HR hitters and labels confidence instead of filtering everything out.
+    Always shows top recent HR hitters when possible, but avoids per-player game-feed scans.
     """
     if not ENABLE_2HR_WATCH:
         return []
 
     candidates = []
     pitcher_hr9_cache = {}
-    contact_cache = {}
 
-    # Map several team keys -> today's game/team id so matching does not fail on abbreviation differences.
+    # Map team keys -> today's game/team id.
     team_context = {}
     for game in today_games:
         for team in (game.get("away") or {}, game.get("home") or {}):
@@ -629,8 +684,9 @@ def build_2hr_watch(today_games, hot_streaks, top_n: int = TWO_HR_WATCH_TOP_N):
                     }
 
     # Only evaluate recent HR hitters, not every active player.
-    # Use a bigger pool so we still get candidates on lighter days.
     pool = hot_streaks[: max(top_n * 4, 20)]
+    candidate_ids = [row.get("player_id") for row in pool if row.get("player_id")]
+    contact_cache = collect_recent_contact_for_players(candidate_ids, days=3)
 
     for hot in pool:
         player_id = hot.get("player_id")
@@ -644,7 +700,6 @@ def build_2hr_watch(today_games, hot_streaks, top_n: int = TWO_HR_WATCH_TOP_N):
 
         context = team_context.get(str(team_abbr).upper())
 
-        # Do NOT skip if we cannot match today's game. Still score the hitter from recent form/contact.
         game = context["game"] if context else None
         team_id = context["team_id"] if context else None
 
@@ -660,9 +715,6 @@ def build_2hr_watch(today_games, hot_streaks, top_n: int = TWO_HR_WATCH_TOP_N):
                 pitcher_hr9_cache[pitcher_id] = get_pitcher_hr_per_9(pitcher_id)
 
             pitcher_hr9 = pitcher_hr9_cache.get(pitcher_id) if pitcher_id else None
-
-        if player_id and player_id not in contact_cache:
-            contact_cache[player_id] = collect_recent_contact_for_player(player_id, days=3)
 
         contact = contact_cache.get(player_id, {"near_hr_count": 0, "max_ev": None, "last_hr_ev": None})
         near_hr_count = int(contact.get("near_hr_count", 0) or 0)
@@ -761,20 +813,54 @@ async def send_birthday_embed(channel, birthday_narratives):
 
 async def post_daily_hr_recap(force=False):
     target_date = yesterday_str()
+
     if not force and state.get("last_daily_recap_date") == target_date:
         log.info("Daily recap already posted for %s", target_date)
         return
+
     channel = await client.fetch_channel(DISCORD_CHANNEL_ID)
+
     try:
-        recap = await asyncio.to_thread(build_yesterday_recap, target_date)
-        hot_streaks = await asyncio.to_thread(build_hot_streaks)
+        if force:
+            await channel.send("Loading HR recap...")
+        recap = await asyncio.wait_for(
+            asyncio.to_thread(build_yesterday_recap, target_date),
+            timeout=REPORT_BUILD_TIMEOUT_SECONDS,
+        )
+
+        if force:
+            await channel.send("Loading hot streaks...")
+        hot_streaks = await asyncio.wait_for(
+            asyncio.to_thread(build_hot_streaks),
+            timeout=REPORT_BUILD_TIMEOUT_SECONDS,
+        )
+
         today_games = await asyncio.to_thread(get_today_games)
-        birthday_narratives = await asyncio.to_thread(build_birthday_narratives, today_games, hot_streaks)
-        two_hr_watch = await asyncio.to_thread(build_2hr_watch, today_games, hot_streaks)
+
+        if force:
+            await channel.send("Building 2-HR Watch...")
+        two_hr_watch = await asyncio.wait_for(
+            asyncio.to_thread(build_2hr_watch, today_games, hot_streaks),
+            timeout=REPORT_BUILD_TIMEOUT_SECONDS,
+        )
+
+        birthday_narratives = await asyncio.wait_for(
+            asyncio.to_thread(build_birthday_narratives, today_games, hot_streaks),
+            timeout=REPORT_BUILD_TIMEOUT_SECONDS,
+        )
+
+    except asyncio.TimeoutError:
+        await channel.send("Report build timed out while MLB data was loading. Try again in a few minutes.")
+        log.exception("Report build timed out")
+        return
+
     except Exception as exc:
+        await channel.send("Could not build the HR recap right now.")
         log.exception("Failed building daily recap: %s", exc)
         return
+
     games = recap["games"]
+
     if not games:
         await channel.send(f"💣 **Yesterday's HR Recap — {target_date}**\nNo home runs found.")
     else:
@@ -785,11 +871,14 @@ async def post_daily_hr_recap(force=False):
             for hitter in game["hitters"]:
                 lines.append(f"• {hitter['name']} ({hitter['team_abbr']}) — {hitter['hr_count']} HR")
             lines.append("")
+
         for chunk in split_lines_into_chunks(header, lines):
             await channel.send(chunk)
+
     await send_hot_streaks_embed(channel, hot_streaks)
     await send_2hr_watch_embed(channel, two_hr_watch)
     await send_birthday_embed(channel, birthday_narratives)
+
     state["last_daily_recap_date"] = target_date
     save_state()
     log.info("Daily recap posted for %s", target_date)
@@ -844,19 +933,31 @@ async def on_message(message):
         return
     content = message.content.strip().lower()
     if content == "!yhr":
-        await message.channel.send("Building yesterday's HR recap...")
+        await message.channel.send("Building yesterday's HR recap... this may take a moment while MLB data loads.")
         await post_daily_hr_recap(force=True)
     elif content == "!2hr":
         await message.channel.send("Building 2-HR Watch... checking recent HR hitters only.")
         try:
-            hot_streaks = await asyncio.to_thread(build_hot_streaks)
+            hot_streaks = await asyncio.wait_for(
+                asyncio.to_thread(build_hot_streaks),
+                timeout=REPORT_BUILD_TIMEOUT_SECONDS,
+            )
             today_games = await asyncio.to_thread(get_today_games)
-            two_hr_watch = await asyncio.to_thread(build_2hr_watch, today_games, hot_streaks)
+            two_hr_watch = await asyncio.wait_for(
+                asyncio.to_thread(build_2hr_watch, today_games, hot_streaks),
+                timeout=REPORT_BUILD_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            await message.channel.send("2-HR Watch timed out while MLB data was loading. Try again in a few minutes.")
+            log.exception("2HR command timed out")
+            return
         except Exception as exc:
             log.exception("2HR command failed: %s", exc)
             await message.channel.send("Could not build 2-HR Watch right now.")
             return
+
         await send_2hr_watch_embed(message.channel, two_hr_watch)
+
     elif content == "!bday":
         await message.channel.send("Checking today's birthday narrative...")
         try:
