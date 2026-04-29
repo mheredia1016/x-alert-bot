@@ -13,6 +13,10 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "15"))
 TIMEZONE = os.getenv("TIMEZONE", "America/Chicago")
+REPORT_BUILD_TIMEOUT_SECONDS = int(os.getenv("REPORT_BUILD_TIMEOUT_SECONDS", "120"))
+SKIP_OLD_PLAYS_ON_STARTUP = os.getenv("SKIP_OLD_PLAYS_ON_STARTUP", "true").lower() == "true"
+OLD_PLAY_MAX_MINUTES = int(os.getenv("OLD_PLAY_MAX_MINUTES", "10"))
+DISABLE_STARTUP_MESSAGE = os.getenv("DISABLE_STARTUP_MESSAGE", "false").lower() == "true"
 
 DAILY_RECAP_HOUR = int(os.getenv("DAILY_RECAP_HOUR", "8"))
 DAILY_RECAP_MINUTE = int(os.getenv("DAILY_RECAP_MINUTE", "0"))
@@ -855,7 +859,7 @@ async def post_daily_hr_recap(force=False):
         return
 
     except Exception as exc:
-        await channel.send("Could not build the HR recap right now.")
+        await channel.send(f"Could not build the HR recap right now. Error: `{type(exc).__name__}: {exc}`")
         log.exception("Failed building daily recap: %s", exc)
         return
 
@@ -887,7 +891,7 @@ async def post_daily_hr_recap(force=False):
 async def maybe_run_scheduled_daily_recap():
     now = datetime.now(TZ)
     schedule_key = now.strftime("%Y-%m-%d-%H-%M")
-    if now.hour == DAILY_RECAP_HOUR and now.minute == DAILY_RECAP_MINUTE and state.get("last_schedule_check_minute") != schedule_key:
+    if now.hour == DAILY_RECAP_HOUR and DAILY_RECAP_MINUTE <= now.minute <= DAILY_RECAP_MINUTE + 5 and state.get("last_schedule_check_minute") != schedule_key:
         state["last_schedule_check_minute"] = schedule_key
         save_state()
         log.info("Scheduled daily recap trigger fired at %s", now.isoformat())
