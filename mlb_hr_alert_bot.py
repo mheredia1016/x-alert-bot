@@ -949,12 +949,16 @@ async def post_daily_hr_recap(force: bool = False):
 
     channel = await client.fetch_channel(DISCORD_CHANNEL_ID)
 
-    try:
+try:
     recap = await asyncio.to_thread(build_yesterday_recap, target_date)
     hot_streaks = await asyncio.to_thread(build_hot_streaks)
     today_games = await asyncio.to_thread(get_today_games)
-    birthday_narratives = await asyncio.to_thread(build_birthday_narratives, today_games, hot_streaks)
-    two_hr_watch = await asyncio.to_thread(build_2hr_watch, today_games, hot_streaks)
+    birthday_narratives = await asyncio.to_thread(
+        build_birthday_narratives, today_games, hot_streaks
+    )
+    two_hr_watch = await asyncio.to_thread(
+        build_2hr_watch, today_games, hot_streaks
+    )
 
 except Exception as exc:
     log.exception("Failed building daily recap: %s", exc)
