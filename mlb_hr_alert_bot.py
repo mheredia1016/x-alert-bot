@@ -593,88 +593,99 @@ def active_roster_players_for_team(team_id, team_abbr):
     return [{"player_id": p.get("id"), "name": p.get("fullName", "Unknown"), "team_id": team_id, "team_abbr": team_abbr} for p in people]
 
 
-def build_2hr_watch(today_games, hot_streaks, top_n=TWO_HR_WATCH_TOP_N):
+def build_2hr_watch(today_games, hot_streaks, top_n: int = TWO_HR_WATCH_TOP_N):
+    """
+    Fast MLB-only 2-HR Watch.
+
+    This optimized version only checks players already showing recent HR form.
+    That keeps !2hr from hanging by avoiding full active-roster scans.
+    """
     if not ENABLE_2HR_WATCH:
         return []
-    hot_lookup = {row["player_id"]: row for row in hot_streaks if row.get("player_id")}
+
     candidates = []
     pitcher_hr9_cache = {}
     contact_cache = {}
+
+    # Map team abbreviation -> today's game/team id.
+    team_context = {}
     for game in today_games:
         for team in (game.get("away") or {}, game.get("home") or {}):
+            abbr = team.get("abbreviation") or team.get("teamName") or team.get("name")
             team_id = team.get("id")
-            team_abbr = team.get("abbreviation") or team.get("teamName") or team.get("name") or "MLB"
-            if not team_id:
-                continue
-            players = active_roster_players_for_team(team_id, team_abbr)
-            probable_pitcher = get_probable_pitcher_for_team(game, team_id)
-            pitcher_id = probable_pitcher.get("id") if probable_pitcher else None
-            pitcher_name = probable_pitcher.get("fullName") if probable_pitcher else "TBD"
-            if pitcher_id and pitcher_id not in pitcher_hr9_cache:
-                pitcher_hr9_cache[pitcher_id] = get_pitcher_hr_per_9(pitcher_id)
-            pitcher_hr9 = pitcher_hr9_cache.get(pitcher_id) if pitcher_id else None
-            for player in players:
-                player_id = player.get("player_id")
-                hot = hot_lookup.get(player_id, {"total_hr": 0, "streak_days": 0, "team_abbr": team_abbr, "name": player["name"], "player_id": player_id})
-                if player_id not in contact_cache:
-                    contact_cache[player_id] = collect_recent_contact_for_player(player_id, days=3)
-                contact = contact_cache[player_id]
-                last_7_hr = int(hot.get("total_hr", 0) or 0)
-                streak_days = int(hot.get("streak_days", 0) or 0)
-                near_hr_count = int(contact.get("near_hr_count", 0) or 0)
-                max_ev = contact.get("max_ev")
-                last_hr_ev = contact.get("last_hr_ev")
-                score = 0
-                score += last_7_hr * 12
-                score += streak_days * 7
-                score += near_hr_count * 8
-                if last_hr_ev:
-                    score += max(0, last_hr_ev - 95) * 0.8
-                elif max_ev:
-                    score += max(0, max_ev - 98) * 0.5
-                if pitcher_hr9:
-                    score += pitcher_hr9 * 10
-                if score < TWO_HR_MIN_SCORE:
-                    continue
-                candidates.append({
-                    "name": player["name"], "team_abbr": team_abbr, "game": game_label(game),
-                    "last_7_hr": last_7_hr, "streak_days": streak_days, "near_hr_count": near_hr_count,
-                    "max_ev": max_ev, "last_hr_ev": last_hr_ev, "pitcher_name": pitcher_name,
-                    "pitcher_hr9": pitcher_hr9, "score": round(score),
-                })
+            if abbr:
+                team_context[abbr] = {
+                    "team_id": team_id,
+                    "game": game,
+                }
+
+    # Only evaluate recent HR hitters, not every active player.
+    for hot in hot_streaks[: max(top_n * 2, 10)]:
+        player_id = hot.get("player_id")
+        player_name = hot.get("name", "Unknown")
+        team_abbr = hot.get("team_abbr", "MLB")
+        last_7_hr = int(hot.get("total_hr", 0) or 0)
+        streak_days = int(hot.get("streak_days", 0) or 0)
+
+        if last_7_hr <= 0:
+            continue
+
+        context = team_context.get(team_abbr)
+        if not context:
+            continue
+
+        game = context["game"]
+        team_id = context["team_id"]
+
+        probable_pitcher = get_probable_pitcher_for_team(game, team_id) if team_id else None
+        pitcher_id = probable_pitcher.get("id") if probable_pitcher else None
+        pitcher_name = probable_pitcher.get("fullName") if probable_pitcher else "TBD"
+
+        if pitcher_id and pitcher_id not in pitcher_hr9_cache:
+            pitcher_hr9_cache[pitcher_id] = get_pitcher_hr_per_9(pitcher_id)
+
+        pitcher_hr9 = pitcher_hr9_cache.get(pitcher_id) if pitcher_id else None
+
+        if player_id and player_id not in contact_cache:
+            contact_cache[player_id] = collect_recent_contact_for_player(player_id, days=3)
+
+        contact = contact_cache.get(player_id, {"near_hr_count": 0, "max_ev": None, "last_hr_ev": None})
+        near_hr_count = int(contact.get("near_hr_count", 0) or 0)
+        max_ev = contact.get("max_ev")
+        last_hr_ev = contact.get("last_hr_ev")
+
+        score = 0
+        score += last_7_hr * 12
+        score += streak_days * 7
+        score += near_hr_count * 8
+
+        if last_hr_ev:
+            score += max(0, last_hr_ev - 95) * 0.8
+        elif max_ev:
+            score += max(0, max_ev - 98) * 0.5
+
+        if pitcher_hr9:
+            score += pitcher_hr9 * 10
+
+        if score < TWO_HR_MIN_SCORE:
+            continue
+
+        candidates.append({
+            "name": player_name,
+            "team_abbr": team_abbr,
+            "game": game_label(game),
+            "last_7_hr": last_7_hr,
+            "streak_days": streak_days,
+            "near_hr_count": near_hr_count,
+            "max_ev": max_ev,
+            "last_hr_ev": last_hr_ev,
+            "pitcher_name": pitcher_name,
+            "pitcher_hr9": pitcher_hr9,
+            "score": round(score),
+        })
+
     candidates.sort(key=lambda x: (-x["score"], -x["last_7_hr"], -x["near_hr_count"], x["name"]))
     return candidates[:top_n]
-
-
-def split_lines_into_chunks(header, lines, limit=1900):
-    chunks = []
-    current = header
-    for line in lines:
-        addition = f"{line}\n"
-        if len(current) + len(addition) > limit:
-            chunks.append(current.rstrip())
-            current = addition
-        else:
-            current += addition
-    if current.strip():
-        chunks.append(current.rstrip())
-    return chunks
-
-
-async def send_hot_streaks_embed(channel, hot_streaks):
-    if not hot_streaks:
-        return
-    embed = discord.Embed(title=f"🔥 Hot HR Streaks (Last {HOT_STREAK_DAYS} Days)", color=discord.Color.gold(), description="Top homer hitters heading into today")
-    for row in hot_streaks:
-        streak_text = f"{row['streak_days']} straight day" if row["streak_days"] == 1 else f"{row['streak_days']} straight days"
-        if row["streak_days"] == 0:
-            streak_text = "No current streak"
-        embed.add_field(name=f"{row['name']} ({row['team_abbr']})", value=f"{row['total_hr']} HR in last {HOT_STREAK_DAYS} days\n{streak_text}", inline=False)
-    top_logo = team_logo(hot_streaks[0]["team_abbr"])
-    if top_logo:
-        embed.set_thumbnail(url=top_logo)
-    embed.set_footer(text=f"Updated daily at {DAILY_RECAP_HOUR}:{DAILY_RECAP_MINUTE:02d} {TIMEZONE}")
-    await channel.send(embed=embed)
 
 
 async def send_2hr_watch_embed(channel, two_hr_watch):
@@ -811,7 +822,7 @@ async def on_message(message):
         await message.channel.send("Building yesterday's HR recap...")
         await post_daily_hr_recap(force=True)
     elif content == "!2hr":
-        await message.channel.send("Building 2-HR Watch...")
+        await message.channel.send("Building 2-HR Watch... checking recent HR hitters only.")
         try:
             hot_streaks = await asyncio.to_thread(build_hot_streaks)
             today_games = await asyncio.to_thread(get_today_games)
