@@ -358,6 +358,10 @@ async def confirm_and_send_near_hr(channel, game, play_id):
 
 
 
+# =========================
+# NO HR THROUGH 3 ROAST ALERTS
+# =========================
+
 NO_HR_THROUGH_3_MESSAGES = [
     "The home run slips are currently in witness protection.",
     "Everyone who bet a homer is now staring at the TV like it owes them money.",
@@ -371,6 +375,10 @@ NO_HR_THROUGH_3_MESSAGES = [
     "Power hitters are currently loading... very slowly.",
     "The HR props are sweating less than we are.",
     "Somebody tell the bats this is not a contact-hitting support group.",
+    "At this point, the baseballs are asking for PTO.",
+    "No bombs yet. Just vibes and bad tickets.",
+    "The warning track is getting more action than our HR slips.",
+    "Three innings in and the bats are still in airplane mode.",
 ]
 
 
@@ -1026,6 +1034,7 @@ async def on_ready():
     if loop_task is None or loop_task.done():
         loop_task = client.loop.create_task(loop())
         log.info("Started live alert loop")
+        log.info("No HR through 3 alert enabled: %s", ENABLE_NO_HR_THROUGH_3_ALERT)
     else:
         log.info("Live alert loop already running")
 
