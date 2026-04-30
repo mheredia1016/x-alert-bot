@@ -32,6 +32,25 @@ ENABLE_BIRTHDAY_NARRATIVE = os.getenv("ENABLE_BIRTHDAY_NARRATIVE", "true").lower
 # No HR through 3 innings roast alert
 ENABLE_NO_HR_THROUGH_3_ALERT = os.getenv("ENABLE_NO_HR_THROUGH_3_ALERT", "true").lower() == "true"
 
+# Odds API: delayed "more HR" follow-up after a player homers
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
+ENABLE_MORE_HR_ODDS = os.getenv("ENABLE_MORE_HR_ODDS", "false").lower() == "true"
+MORE_HR_ODDS_DELAY_SECONDS = int(os.getenv("MORE_HR_ODDS_DELAY_SECONDS", "90"))
+MORE_HR_MIN_BOOKS = int(os.getenv("MORE_HR_MIN_BOOKS", "1"))
+ODDS_REGION = os.getenv("ODDS_REGION", "us")
+ODDS_FORMAT = os.getenv("ODDS_FORMAT", "american")
+ODDS_BOOKMAKERS = os.getenv("ODDS_BOOKMAKERS", "draftkings,fanduel,betmgm")
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+ODDS_SPORT_KEY = "baseball_mlb"
+
+# Morning HR parlay section in daily report
+ENABLE_MORNING_HR_PARLAYS = os.getenv("ENABLE_MORNING_HR_PARLAYS", "true").lower() == "true"
+MORNING_PARLAY_LEGS_SAFE = int(os.getenv("MORNING_PARLAY_LEGS_SAFE", "2"))
+MORNING_PARLAY_LEGS_RISKY = int(os.getenv("MORNING_PARLAY_LEGS_RISKY", "3"))
+MORNING_PARLAY_LEGS_BOMB = int(os.getenv("MORNING_PARLAY_LEGS_BOMB", "4"))
+
+
+
 NEAR_HR_MIN_EV = float(os.getenv("NEAR_HR_MIN_EV", "102"))
 NEAR_HR_MIN_ANGLE = float(os.getenv("NEAR_HR_MIN_ANGLE", "22"))
 NEAR_HR_MAX_ANGLE = float(os.getenv("NEAR_HR_MAX_ANGLE", "38"))
@@ -66,6 +85,7 @@ state = {
     "last_daily_recap_date": None,
     "last_schedule_check_minute": None,
     "seen_no_hr_3rd_game_ids": [],
+    "seen_more_hr_odds_keys": [],
 }
 
 TEAM_COLORS = {
@@ -109,6 +129,7 @@ def load_state():
     state.setdefault("last_daily_recap_date", None)
     state.setdefault("last_schedule_check_minute", None)
     state.setdefault("seen_no_hr_3rd_game_ids", [])
+    state.setdefault("seen_more_hr_odds_keys", [])
 
 
 def save_state():
@@ -116,6 +137,7 @@ def save_state():
     state["seen_near_hr_play_ids"] = state["seen_near_hr_play_ids"][-1000:]
     state["pending_near_hr_play_ids"] = state["pending_near_hr_play_ids"][-1000:]
     state["seen_no_hr_3rd_game_ids"] = state["seen_no_hr_3rd_game_ids"][-500:]
+    state["seen_more_hr_odds_keys"] = state["seen_more_hr_odds_keys"][-500:]
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
@@ -286,6 +308,7 @@ async def send_alert(channel, game, play, alert_type, all_plays=None):
     color_value = TEAM_COLORS.get(team_abbr, 0x1D428A)
     color = discord.Color.orange() if alert_type == "near" else discord.Color(color_value)
     title = "💣 Home Run" if alert_type == "hr" else "⚠️ Near Home Run"
+    hr_number = None
     hr_number_text = None
     if alert_type == "hr" and all_plays:
         hr_number = player_hr_number_in_game(all_plays, play)
@@ -318,6 +341,17 @@ async def send_alert(channel, game, play, alert_type, all_plays=None):
         embed.set_image(url=headshot_url)
     embed.set_footer(text="MLB live feed")
     await channel.send(embed=embed)
+
+    if alert_type == "hr" and hr_number in (1, 2):
+        asyncio.create_task(
+            send_more_hr_odds_after_delay(
+                channel=channel,
+                game=game,
+                player_name=batter_name,
+                player_id=batter.get("id"),
+                current_hr_count=hr_number,
+            )
+        )
 
 
 async def confirm_and_send_near_hr(channel, game, play_id):
@@ -355,6 +389,318 @@ async def confirm_and_send_near_hr(channel, game, play_id):
         if play_id in state["pending_near_hr_play_ids"]:
             state["pending_near_hr_play_ids"].remove(play_id)
         save_state()
+
+
+
+
+# =========================
+# ODDS API: MORE HR FOLLOW-UP
+# =========================
+
+SPORTSBOOK_LINKS = {
+    "draftkings": "https://sportsbook.draftkings.com/",
+    "fanduel": "https://sportsbook.fanduel.com/",
+    "betmgm": "https://sports.betmgm.com/",
+    "caesars": "https://www.caesars.com/sportsbook-and-casino",
+    "betrivers": "https://www.betrivers.com/",
+    "fanatics": "https://sportsbook.fanatics.com/",
+    "espnbet": "https://espnbet.com/",
+    "bet365": "https://www.bet365.com/",
+}
+
+
+def normalize_text(value: str) -> str:
+    return "".join(ch for ch in (value or "").lower() if ch.isalnum())
+
+
+def normalize_player_name(value: str) -> str:
+    return " ".join((value or "").lower().replace(".", "").replace("'", "").split())
+
+
+def format_american_odds(price):
+    if price is None:
+        return "N/A"
+
+    try:
+        price = int(price)
+    except Exception:
+        return str(price)
+
+    return f"+{price}" if price > 0 else str(price)
+
+
+def american_to_decimal(price):
+    try:
+        price = int(price)
+    except Exception:
+        return None
+
+    if price > 0:
+        return 1 + (price / 100)
+
+    return 1 + (100 / abs(price))
+
+
+def combined_american_odds(prices):
+    decimal_total = 1.0
+
+    for price in prices:
+        dec = american_to_decimal(price)
+        if dec is None:
+            return None
+        decimal_total *= dec
+
+    if decimal_total >= 2:
+        return round((decimal_total - 1) * 100)
+
+    return round(-100 / (decimal_total - 1))
+
+
+def get_bet_link_from_node(*nodes):
+    """
+    The Odds API includeLinks=true can add links on bookmaker / market / outcome nodes.
+    This helper tries common shapes safely.
+    """
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+
+        direct = node.get("link")
+        if isinstance(direct, str) and direct:
+            return direct
+
+        links = node.get("links")
+        if isinstance(links, dict):
+            for key in ("bet", "betslip", "market", "event", "desktop", "mobile", "web"):
+                value = links.get(key)
+                if isinstance(value, str) and value:
+                    return value
+
+        if isinstance(links, str) and links:
+            return links
+
+    return ""
+
+
+
+def get_odds_json(url: str, params: dict) -> dict:
+    response = session.get(url, params=params, timeout=25)
+    response.raise_for_status()
+    return response.json()
+
+
+def odds_bookmaker_filter_params():
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": ODDS_REGION,
+        "oddsFormat": ODDS_FORMAT,
+    }
+
+    if ODDS_BOOKMAKERS.strip():
+        params["bookmakers"] = ODDS_BOOKMAKERS.strip()
+
+    return params
+
+
+def fetch_today_odds_events():
+    """
+    Gets today's MLB odds event IDs from The Odds API.
+    Uses h2h only to find events cheaply, then event endpoint for player props.
+    """
+    if not ODDS_API_KEY:
+        return []
+
+    params = odds_bookmaker_filter_params()
+    params["markets"] = "h2h"
+
+    url = f"{ODDS_API_BASE}/sports/{ODDS_SPORT_KEY}/odds"
+    return get_odds_json(url, params=params)
+
+
+def team_names_match(mlb_name: str, odds_name: str) -> bool:
+    mlb_norm = normalize_text(mlb_name)
+    odds_norm = normalize_text(odds_name)
+
+    if not mlb_norm or not odds_norm:
+        return False
+
+    return mlb_norm in odds_norm or odds_norm in mlb_norm
+
+
+def find_odds_event_id_for_mlb_game(game):
+    """
+    Match MLB Stats API game to The Odds API event by team names.
+    """
+    away = game.get("away") or {}
+    home = game.get("home") or {}
+
+    mlb_away_names = [
+        away.get("name"),
+        away.get("teamName"),
+        away.get("clubName"),
+        away.get("abbreviation"),
+    ]
+    mlb_home_names = [
+        home.get("name"),
+        home.get("teamName"),
+        home.get("clubName"),
+        home.get("abbreviation"),
+    ]
+
+    try:
+        events = fetch_today_odds_events()
+    except Exception as exc:
+        log.warning("Could not load Odds API events: %s", exc)
+        return None
+
+    for event in events:
+        odds_home = event.get("home_team", "")
+        odds_away = event.get("away_team", "")
+
+        away_match = any(team_names_match(name, odds_away) for name in mlb_away_names if name)
+        home_match = any(team_names_match(name, odds_home) for name in mlb_home_names if name)
+
+        # Some APIs/books can flip display order, so allow reversed as fallback.
+        away_reverse = any(team_names_match(name, odds_home) for name in mlb_away_names if name)
+        home_reverse = any(team_names_match(name, odds_away) for name in mlb_home_names if name)
+
+        if (away_match and home_match) or (away_reverse and home_reverse):
+            return event.get("id")
+
+    return None
+
+
+def fetch_event_more_hr_odds(event_id: str):
+    if not ODDS_API_KEY or not event_id:
+        return {}
+
+    params = odds_bookmaker_filter_params()
+    params["markets"] = "batter_home_runs_alternate"
+
+    url = f"{ODDS_API_BASE}/sports/{ODDS_SPORT_KEY}/events/{event_id}/odds"
+    return get_odds_json(url, params=params)
+
+
+def parse_more_hr_odds_for_player(event_odds: dict, player_name: str, target_point: float):
+    """
+    Finds Over 1.5 or Over 2.5 HR in batter_home_runs_alternate.
+
+    Expected player prop shape from The Odds API:
+    outcome.name = "Over"
+    outcome.description = player name
+    outcome.point = 1.5 / 2.5
+    """
+    target_player = normalize_player_name(player_name)
+    found = []
+
+    for bookmaker in event_odds.get("bookmakers", []):
+        book_key = bookmaker.get("key", "")
+        book_title = bookmaker.get("title") or bookmaker.get("key") or "Book"
+
+        for market in bookmaker.get("markets", []):
+            if market.get("key") != "batter_home_runs_alternate":
+                continue
+
+            for outcome in market.get("outcomes", []):
+                outcome_name = outcome.get("name", "")
+                outcome_desc = outcome.get("description", "")
+                point = outcome.get("point")
+                price = outcome.get("price")
+
+                # Normal expected form: name=Over, description=Player
+                is_over = str(outcome_name).lower() == "over"
+                player_match = normalize_player_name(outcome_desc) == target_player
+
+                # Robust fallback: sometimes player-like text could be in name.
+                fallback_player_match = normalize_player_name(outcome_name) == target_player and str(outcome_desc).lower() == "over"
+
+                try:
+                    point_match = float(point) == float(target_point)
+                except Exception:
+                    point_match = False
+
+                if point_match and price is not None and ((is_over and player_match) or fallback_player_match):
+                    found.append({
+                        "book_key": book_key,
+                        "book_title": book_title,
+                        "price": price,
+                        "link": SPORTSBOOK_LINKS.get(book_key, ""),
+                    })
+
+    # Best plus price first
+    found.sort(key=lambda x: int(x["price"]) if isinstance(x["price"], int) or str(x["price"]).lstrip("-").isdigit() else -9999, reverse=True)
+    return found
+
+
+async def send_more_hr_odds_after_delay(channel, game, player_name: str, player_id, current_hr_count: int):
+    """
+    Sends delayed follow-up:
+    - after 1 HR: Over 1.5 HR odds
+    - after 2 HR: Over 2.5 HR odds
+    """
+    if not ENABLE_MORE_HR_ODDS:
+        return
+
+    if not ODDS_API_KEY:
+        log.info("ENABLE_MORE_HR_ODDS is true but ODDS_API_KEY is missing")
+        return
+
+    if current_hr_count not in (1, 2):
+        return
+
+    odds_key = f"{game.get('gamePk')}-{player_id or player_name}-{current_hr_count}"
+    if odds_key in state["seen_more_hr_odds_keys"]:
+        return
+
+    state["seen_more_hr_odds_keys"].append(odds_key)
+    save_state()
+
+    await asyncio.sleep(MORE_HR_ODDS_DELAY_SECONDS)
+
+    target_point = 1.5 if current_hr_count == 1 else 2.5
+    target_total = 2 if current_hr_count == 1 else 3
+    title_emoji = "🔁" if current_hr_count == 1 else "🚨"
+    title = f"{title_emoji} {target_total}-HR Game Odds — {player_name}"
+
+    try:
+        event_id = await asyncio.to_thread(find_odds_event_id_for_mlb_game, game)
+        if not event_id:
+            log.info("Could not match MLB game to Odds API event for %s", game_label(game))
+            return
+
+        event_odds = await asyncio.to_thread(fetch_event_more_hr_odds, event_id)
+        rows = parse_more_hr_odds_for_player(event_odds, player_name, target_point)
+
+    except Exception as exc:
+        log.warning("Could not fetch more HR odds for %s: %s", player_name, exc)
+        return
+
+    if len(rows) < MORE_HR_MIN_BOOKS:
+        log.info("Not enough books reposted %s over %.1f HR odds. Found %s", player_name, target_point, len(rows))
+        return
+
+    lines = []
+    link_lines = []
+
+    for row in rows[:6]:
+        lines.append(f"• {row['book_title']}: **{format_american_odds(row['price'])}**")
+        if row.get("link"):
+            link_lines.append(f"[{row['book_title']}]({row['link']})")
+
+    description = f"**Over {target_point} HR / {target_total}+ HR Game**\n" + "\n".join(lines)
+
+    if link_lines:
+        description += "\n\n**Sportsbook links:**\n" + " • ".join(link_lines[:6])
+
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=discord.Color.green(),
+        url=f"https://www.mlb.com/gameday/{game['gamePk']}",
+    )
+    embed.set_footer(text=f"Delayed {MORE_HR_ODDS_DELAY_SECONDS}s to let books repost live alt-HR markets")
+
+    await channel.send(embed=embed)
 
 
 
@@ -988,6 +1334,7 @@ async def post_daily_hr_recap(force=False):
 
     await send_hot_streaks_embed(channel, hot_streaks)
     await send_2hr_watch_embed(channel, two_hr_watch)
+    await send_morning_hr_parlays_embed(channel, hot_streaks, two_hr_watch, today_games)
     await send_birthday_embed(channel, birthday_narratives)
 
     state["last_daily_recap_date"] = target_date
@@ -1003,6 +1350,348 @@ async def maybe_run_scheduled_daily_recap():
         save_state()
         log.info("Scheduled daily recap trigger fired at %s", now.isoformat())
         await post_daily_hr_recap(force=False)
+
+
+
+# =========================
+# MORNING HR PARLAYS
+# =========================
+
+def fetch_event_hr_market_for_morning(event_id: str):
+    if not ODDS_API_KEY or not event_id:
+        return {}
+
+    params = odds_bookmaker_filter_params()
+    params["markets"] = "batter_home_runs"
+    params["includeLinks"] = "true"
+    params["includeSids"] = "true"
+
+    url = f"{ODDS_API_BASE}/sports/{ODDS_SPORT_KEY}/events/{event_id}/odds"
+    return get_odds_json(url, params=params)
+
+
+def parse_best_hr_odds_for_morning(event_odds: dict):
+    """
+    Returns best Over 0.5 HR price per player for one event.
+    """
+    best = {}
+
+    for bookmaker in event_odds.get("bookmakers", []):
+        book_key = bookmaker.get("key", "")
+        book_title = bookmaker.get("title") or bookmaker.get("key") or "Book"
+        book_link = get_bet_link_from_node(bookmaker) or SPORTSBOOK_LINKS.get(book_key, "")
+
+        for market in bookmaker.get("markets", []):
+            if market.get("key") != "batter_home_runs":
+                continue
+
+            market_link = get_bet_link_from_node(market)
+
+            for outcome in market.get("outcomes", []):
+                if str(outcome.get("name", "")).lower() != "over":
+                    continue
+
+                point = outcome.get("point")
+                try:
+                    if point is not None and float(point) != 0.5:
+                        continue
+                except Exception:
+                    pass
+
+                player_name = outcome.get("description")
+                price = outcome.get("price")
+
+                if not player_name or price is None:
+                    continue
+
+                link = get_bet_link_from_node(outcome, market, bookmaker) or market_link or book_link
+                key = normalize_player_name(player_name)
+
+                current = best.get(key)
+                if current is None or int(price) > int(current["price"]):
+                    best[key] = {
+                        "player_name": player_name,
+                        "price": price,
+                        "book_key": book_key,
+                        "book_title": book_title,
+                        "link": link,
+                    }
+
+    return list(best.values())
+
+
+def build_today_hr_odds_rows(today_games):
+    """
+    Pulls HR odds for today's MLB games and returns one best-price row per player.
+    Controlled by ODDS_BOOKMAKERS to limit API usage.
+    """
+    rows_by_player = {}
+
+    for game in today_games:
+        try:
+            event_id = find_odds_event_id_for_mlb_game(game)
+            if not event_id:
+                continue
+
+            event_odds = fetch_event_hr_market_for_morning(event_id)
+            rows = parse_best_hr_odds_for_morning(event_odds)
+
+            for row in rows:
+                key = normalize_player_name(row["player_name"])
+                current = rows_by_player.get(key)
+
+                if current is None or int(row["price"]) > int(current["price"]):
+                    row["game"] = game_label(game)
+                    rows_by_player[key] = row
+
+        except Exception as exc:
+            log.warning("Could not load morning HR odds for %s: %s", game_label(game), exc)
+            continue
+
+    return list(rows_by_player.values())
+
+
+def build_morning_player_score_lookup(hot_streaks, two_hr_watch):
+    lookup = {}
+
+    for row in hot_streaks:
+        key = normalize_player_name(row.get("name", ""))
+        lookup[key] = {
+            "name": row.get("name", ""),
+            "team_abbr": row.get("team_abbr", ""),
+            "last_7_hr": int(row.get("total_hr", 0) or 0),
+            "streak_days": int(row.get("streak_days", 0) or 0),
+            "near_hr_count": 0,
+            "last_hr_ev": None,
+            "max_ev": None,
+            "pitcher_hr9": None,
+            "score": int(row.get("total_hr", 0) or 0) * 12 + int(row.get("streak_days", 0) or 0) * 7,
+        }
+
+    for row in two_hr_watch:
+        key = normalize_player_name(row.get("name", ""))
+        base = lookup.setdefault(key, {
+            "name": row.get("name", ""),
+            "team_abbr": row.get("team_abbr", ""),
+            "last_7_hr": 0,
+            "streak_days": 0,
+            "near_hr_count": 0,
+            "last_hr_ev": None,
+            "max_ev": None,
+            "pitcher_hr9": None,
+            "score": 0,
+        })
+
+        base["team_abbr"] = row.get("team_abbr") or base.get("team_abbr", "")
+        base["near_hr_count"] = int(row.get("near_hr_count", 0) or 0)
+        base["last_hr_ev"] = row.get("last_hr_ev")
+        base["max_ev"] = row.get("max_ev")
+        base["pitcher_hr9"] = row.get("pitcher_hr9")
+        base["score"] = max(base.get("score", 0), int(row.get("score", 0) or 0))
+
+    return lookup
+
+
+def enrich_hr_parlay_candidates(odds_rows, hot_streaks, two_hr_watch):
+    score_lookup = build_morning_player_score_lookup(hot_streaks, two_hr_watch)
+    candidates = []
+
+    for odds in odds_rows:
+        name_key = normalize_player_name(odds.get("player_name", ""))
+        score_data = score_lookup.get(name_key)
+
+        # Still allow players not in hot list, but give them a lower score.
+        if not score_data:
+            score_data = {
+                "team_abbr": "",
+                "last_7_hr": 0,
+                "streak_days": 0,
+                "near_hr_count": 0,
+                "last_hr_ev": None,
+                "max_ev": None,
+                "pitcher_hr9": None,
+                "score": 0,
+            }
+
+        price = int(odds["price"])
+        model_score = float(score_data.get("score", 0) or 0)
+
+        # Odds profile adjustment.
+        # Safe leans to shorter odds; risky/bomb selection will bucket separately.
+        if price <= 350:
+            model_score += 14
+        elif price <= 500:
+            model_score += 10
+        elif price <= 750:
+            model_score += 6
+        else:
+            model_score += 2
+
+        candidates.append({
+            "name": odds["player_name"],
+            "team_abbr": score_data.get("team_abbr", ""),
+            "price": price,
+            "book_title": odds.get("book_title", "Book"),
+            "book_key": odds.get("book_key", ""),
+            "link": odds.get("link", ""),
+            "game": odds.get("game", ""),
+            "last_7_hr": score_data.get("last_7_hr", 0),
+            "streak_days": score_data.get("streak_days", 0),
+            "near_hr_count": score_data.get("near_hr_count", 0),
+            "last_hr_ev": score_data.get("last_hr_ev"),
+            "max_ev": score_data.get("max_ev"),
+            "pitcher_hr9": score_data.get("pitcher_hr9"),
+            "model_score": round(model_score, 1),
+        })
+
+    return candidates
+
+
+def pick_unique_team_legs(pool, max_legs, used_global=None):
+    if used_global is None:
+        used_global = set()
+
+    picked = []
+    used_teams = set()
+
+    for item in pool:
+        team = item.get("team_abbr") or item.get("name")
+        player_key = normalize_player_name(item.get("name", ""))
+
+        if team in used_teams:
+            continue
+
+        if player_key in used_global:
+            continue
+
+        picked.append(item)
+        used_teams.add(team)
+        used_global.add(player_key)
+
+        if len(picked) >= max_legs:
+            break
+
+    # Can be as little as 2. If only one strong leg, still return it rather than forcing junk.
+    return picked
+
+
+def build_best_morning_hr_parlays(hot_streaks, two_hr_watch, odds_rows):
+    candidates = enrich_hr_parlay_candidates(odds_rows, hot_streaks, two_hr_watch)
+
+    if not candidates:
+        return {"safe": [], "risky": [], "bomb": []}
+
+    used_global = set()
+
+    safe_pool = sorted(
+        [c for c in candidates if c["price"] <= 500],
+        key=lambda x: (-x["model_score"], x["price"], x["name"]),
+    )
+
+    risky_pool = sorted(
+        [c for c in candidates if 450 <= c["price"] <= 800],
+        key=lambda x: (-x["model_score"], -x["price"], x["name"]),
+    )
+
+    bomb_pool = sorted(
+        [c for c in candidates if c["price"] >= 650],
+        key=lambda x: (-x["model_score"], -x["price"], x["name"]),
+    )
+
+    all_by_score = sorted(candidates, key=lambda x: (-x["model_score"], x["price"], x["name"]))
+    all_by_price = sorted(candidates, key=lambda x: (-x["price"], -x["model_score"], x["name"]))
+
+    safe = pick_unique_team_legs(
+        safe_pool or all_by_score,
+        max(2, min(4, MORNING_PARLAY_LEGS_SAFE)),
+        used_global,
+    )
+    risky = pick_unique_team_legs(
+        risky_pool or all_by_score,
+        max(2, min(4, MORNING_PARLAY_LEGS_RISKY)),
+        used_global,
+    )
+    bomb = pick_unique_team_legs(
+        bomb_pool or all_by_price,
+        max(2, min(4, MORNING_PARLAY_LEGS_BOMB)),
+        used_global,
+    )
+
+    return {"safe": safe, "risky": risky, "bomb": bomb}
+
+
+def morning_parlay_tier_text(rows):
+    if not rows:
+        return "Not enough quality legs available."
+
+    lines = []
+
+    for row in rows:
+        odds_text = format_american_odds(row["price"])
+        player = row["name"]
+        book = row.get("book_title", "Book")
+        link = row.get("link") or SPORTSBOOK_LINKS.get(row.get("book_key", ""), "")
+
+        stats = []
+        if row.get("last_7_hr"):
+            stats.append(f"{row['last_7_hr']} HR last {HOT_STREAK_DAYS}d")
+        if row.get("near_hr_count"):
+            stats.append(f"{row['near_hr_count']} near-HR last 3g")
+        if row.get("last_hr_ev"):
+            stats.append(f"{row['last_hr_ev']:.1f} EV last HR")
+        elif row.get("max_ev"):
+            stats.append(f"{row['max_ev']:.1f} max EV")
+        if row.get("pitcher_hr9"):
+            stats.append(f"opp SP {row['pitcher_hr9']} HR/9")
+
+        stat_text = f"\n  {' | '.join(stats)}" if stats else ""
+
+        display = f"[{player}]({link})" if link else player
+        team = f" ({row['team_abbr']})" if row.get("team_abbr") else ""
+
+        lines.append(f"• {display}{team} **{odds_text}** at {book}{stat_text}")
+
+    combined = combined_american_odds([row["price"] for row in rows])
+    if combined is not None and len(rows) > 1:
+        lines.append(f"\nApprox. combined odds: **{format_american_odds(combined)}**")
+
+    return "\n".join(lines)
+
+
+async def send_morning_hr_parlays_embed(channel, hot_streaks, two_hr_watch, today_games):
+    if not ENABLE_MORNING_HR_PARLAYS:
+        return
+
+    if not ODDS_API_KEY:
+        await channel.send("💣 **Best HR Parlays Today**\nODDS_API_KEY is not set, so sportsbook-linked parlays are unavailable.")
+        return
+
+    try:
+        odds_rows = await asyncio.to_thread(build_today_hr_odds_rows, today_games)
+        parlays = await asyncio.to_thread(build_best_morning_hr_parlays, hot_streaks, two_hr_watch, odds_rows)
+
+    except Exception as exc:
+        log.warning("Could not build morning HR parlays: %s", exc)
+        await channel.send("💣 **Best HR Parlays Today**\nCould not load HR odds right now.")
+        return
+
+    if not any(parlays.values()):
+        await channel.send("💣 **Best HR Parlays Today**\nNo sportsbook HR lines available yet.")
+        return
+
+    embed = discord.Embed(
+        title="💣 Best HR Parlays Today",
+        description="Max 4 legs per tier. Picks use MLB form/contact data first, then best available sportsbook HR odds.",
+        color=discord.Color.blue(),
+    )
+
+    embed.add_field(name=f"🟢 Safe — {len(parlays['safe'])} Legs", value=morning_parlay_tier_text(parlays["safe"]), inline=False)
+    embed.add_field(name=f"🟡 Risky — {len(parlays['risky'])} Legs", value=morning_parlay_tier_text(parlays["risky"]), inline=False)
+    embed.add_field(name=f"🔴 Bomb — {len(parlays['bomb'])} Legs", value=morning_parlay_tier_text(parlays["bomb"]), inline=False)
+    embed.set_footer(text="Odds from The Odds API. Links depend on sportsbook availability. Bet responsibly.")
+
+    await channel.send(embed=embed)
+
 
 
 async def loop():
@@ -1035,6 +1724,8 @@ async def on_ready():
         loop_task = client.loop.create_task(loop())
         log.info("Started live alert loop")
         log.info("No HR through 3 alert enabled: %s", ENABLE_NO_HR_THROUGH_3_ALERT)
+        log.info("More HR odds enabled: %s", ENABLE_MORE_HR_ODDS)
+        log.info("Morning HR parlays enabled: %s", ENABLE_MORNING_HR_PARLAYS)
     else:
         log.info("Live alert loop already running")
 
@@ -1069,6 +1760,18 @@ async def on_message(message):
             return
 
         await send_2hr_watch_embed(message.channel, two_hr_watch)
+
+    elif content == "!hrparlays":
+        await message.channel.send("Building today’s best HR parlays...")
+        try:
+            hot_streaks = await asyncio.to_thread(build_hot_streaks)
+            today_games = await asyncio.to_thread(get_today_games)
+            two_hr_watch = await asyncio.to_thread(build_2hr_watch, today_games, hot_streaks)
+            await send_morning_hr_parlays_embed(message.channel, hot_streaks, two_hr_watch, today_games)
+
+        except Exception as exc:
+            log.exception("Morning HR parlays command failed: %s", exc)
+            await message.channel.send("Could not build HR parlays right now.")
 
     elif content == "!bday":
         await message.channel.send("Checking today's birthday narrative...")
