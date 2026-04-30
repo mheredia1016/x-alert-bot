@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import logging
+import random
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -27,6 +28,9 @@ ENABLE_2HR_WATCH = os.getenv("ENABLE_2HR_WATCH", "true").lower() == "true"
 TWO_HR_WATCH_TOP_N = int(os.getenv("TWO_HR_WATCH_TOP_N", "6"))
 TWO_HR_MIN_SCORE = float(os.getenv("TWO_HR_MIN_SCORE", "35"))
 ENABLE_BIRTHDAY_NARRATIVE = os.getenv("ENABLE_BIRTHDAY_NARRATIVE", "true").lower() == "true"
+
+# No HR through 3 innings roast alert
+ENABLE_NO_HR_THROUGH_3_ALERT = os.getenv("ENABLE_NO_HR_THROUGH_3_ALERT", "true").lower() == "true"
 
 NEAR_HR_MIN_EV = float(os.getenv("NEAR_HR_MIN_EV", "102"))
 NEAR_HR_MIN_ANGLE = float(os.getenv("NEAR_HR_MIN_ANGLE", "22"))
@@ -61,6 +65,7 @@ state = {
     "last_startup_date": None,
     "last_daily_recap_date": None,
     "last_schedule_check_minute": None,
+    "seen_no_hr_3rd_game_ids": [],
 }
 
 TEAM_COLORS = {
@@ -103,12 +108,14 @@ def load_state():
     state.setdefault("last_startup_date", None)
     state.setdefault("last_daily_recap_date", None)
     state.setdefault("last_schedule_check_minute", None)
+    state.setdefault("seen_no_hr_3rd_game_ids", [])
 
 
 def save_state():
     state["seen_hr_play_ids"] = state["seen_hr_play_ids"][-500:]
     state["seen_near_hr_play_ids"] = state["seen_near_hr_play_ids"][-1000:]
     state["pending_near_hr_play_ids"] = state["pending_near_hr_play_ids"][-1000:]
+    state["seen_no_hr_3rd_game_ids"] = state["seen_no_hr_3rd_game_ids"][-500:]
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
@@ -350,9 +357,81 @@ async def confirm_and_send_near_hr(channel, game, play_id):
         save_state()
 
 
+
+NO_HR_THROUGH_3_MESSAGES = [
+    "The home run slips are currently in witness protection.",
+    "Everyone who bet a homer is now staring at the TV like it owes them money.",
+    "Three innings in and the ball still hasn’t filed a flight plan.",
+    "The bats are giving warning-track energy only.",
+    "HR bettors are already negotiating with the baseball gods.",
+    "No homers yet. The sportsbook intern is feeling very safe.",
+    "The wind is apparently working for the books today.",
+    "Three innings, zero bombs. Pain.",
+    "The balls are staying in the yard like rent is affordable there.",
+    "Power hitters are currently loading... very slowly.",
+    "The HR props are sweating less than we are.",
+    "Somebody tell the bats this is not a contact-hitting support group.",
+]
+
+
+def game_has_any_hr(plays):
+    return any(is_home_run(play) for play in plays)
+
+
+def game_reached_end_of_3rd(plays):
+    """
+    True once the game has reached the 4th inning.
+    That means 3 full innings have completed.
+    """
+    for play in plays:
+        about = play.get("about", {}) or {}
+        inning = about.get("inning")
+
+        if isinstance(inning, int) and inning >= 4:
+            return True
+
+    return False
+
+
+async def maybe_send_no_hr_3rd_alert(channel, game, plays):
+    if not ENABLE_NO_HR_THROUGH_3_ALERT:
+        return
+
+    game_pk = game.get("gamePk")
+    if not game_pk:
+        return
+
+    game_key = str(game_pk)
+
+    if game_key in state["seen_no_hr_3rd_game_ids"]:
+        return
+
+    if not game_reached_end_of_3rd(plays):
+        return
+
+    if game_has_any_hr(plays):
+        return
+
+    msg = random.choice(NO_HR_THROUGH_3_MESSAGES)
+
+    embed = discord.Embed(
+        title="🫠 No HR Through 3",
+        description=f"**{game_label(game)}**\n\n{msg}",
+        color=discord.Color.dark_grey(),
+    )
+    embed.set_footer(text="HR bettors support group checking in")
+
+    await channel.send(embed=embed)
+
+    state["seen_no_hr_3rd_game_ids"].append(game_key)
+    save_state()
+
+
 async def process_game(channel, game):
     data = get_json(LIVE_FEED_URL.format(gamePk=game["gamePk"]))
     plays = (((data.get("liveData") or {}).get("plays") or {}).get("allPlays") or [])
+
+    await maybe_send_no_hr_3rd_alert(channel, game, plays)
     for play in plays:
         pid = build_play_id(game["gamePk"], play)
         if is_home_run(play):
