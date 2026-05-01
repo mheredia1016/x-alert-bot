@@ -153,6 +153,13 @@ def get_json(url):
     return r.json()
 
 
+
+def get_odds_json(url: str, params: dict) -> dict:
+    resp = session.get(url, params=params, timeout=25)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def today_str():
     return datetime.now(TZ).strftime("%Y-%m-%d")
 
@@ -1693,6 +1700,11 @@ async def on_message(message):
             return
 
         await send_2hr_watch_embed(message.channel, two_hr_watch)
+
+    elif content == "!oddsdebug":
+        await message.channel.send(
+            f"Odds debug: key_set={bool(ODDS_API_KEY)}, get_odds_json_exists={'get_odds_json' in globals()}, books={ODDS_BOOKMAKERS}"
+        )
 
     elif content == "!hrparlays":
         await message.channel.send("Building today’s best HR parlays...")
