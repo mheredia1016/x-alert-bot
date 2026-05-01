@@ -68,6 +68,9 @@ PITCHER_STATS_URL = "https://statsapi.mlb.com/api/v1/people/{personId}/stats?sta
 TZ = ZoneInfo(TIMEZONE)
 session = requests.Session()
 loop_task = None
+live_loop_started = False
+processing_play_ids = set()
+processing_near_play_ids = set()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("mlb_hr_alert_bot")
@@ -136,6 +139,9 @@ def save_state():
     state["seen_hr_play_ids"] = state["seen_hr_play_ids"][-500:]
     state["seen_near_hr_play_ids"] = state["seen_near_hr_play_ids"][-1000:]
     state["pending_near_hr_play_ids"] = state["pending_near_hr_play_ids"][-1000:]
+    for extra_key in ("seen_no_hr_3rd_game_ids", "seen_more_hr_odds_keys", "seen_pregame_parlay_game_ids"):
+        if extra_key in state:
+            state[extra_key] = state[extra_key][-500:]
     state["seen_no_hr_3rd_game_ids"] = state["seen_no_hr_3rd_game_ids"][-500:]
     state["seen_more_hr_odds_keys"] = state["seen_more_hr_odds_keys"][-500:]
     STATE_FILE.write_text(json.dumps(state, indent=2))
@@ -227,9 +233,7 @@ def get_today_games():
 
 
 def build_play_id(game_pk, play):
-    about = play.get("about", {}) or {}
-    return f"{game_pk}-{about.get('atBatIndex')}"
-
+    return make_stable_play_key(game_pk, play)
 
 def is_home_run(play):
     result = play.get("result", {})
@@ -275,6 +279,42 @@ def player_hr_number_in_game(all_plays, current_play):
         if play_batter_id == batter_id and is_home_run(play):
             hr_count += 1
     return hr_count if hr_count > 0 else None
+
+
+
+# =========================
+# DUPLICATE / REDEPLOY PROTECTION
+# =========================
+
+def already_seen_or_claim(list_name: str, key: str) -> bool:
+    if not key:
+        return True
+
+    state.setdefault(list_name, [])
+
+    if key in state[list_name]:
+        return True
+
+    state[list_name].append(key)
+    save_state()
+    return False
+
+
+def make_stable_play_key(game_pk, play):
+    about = play.get("about", {}) or {}
+    matchup = play.get("matchup", {}) or {}
+    batter = matchup.get("batter", {}) or {}
+    result = play.get("result", {}) or {}
+
+    return "|".join([
+        str(game_pk),
+        str(about.get("atBatIndex", "")),
+        str(batter.get("id", "")),
+        str(about.get("inning", "")),
+        str(about.get("halfInning", "")),
+        str(result.get("eventType", "")),
+    ])
+
 
 
 async def send_startup_message():
@@ -360,425 +400,48 @@ async def confirm_and_send_near_hr(channel, game, play_id):
         data = get_json(LIVE_FEED_URL.format(gamePk=game["gamePk"]))
         plays = (((data.get("liveData") or {}).get("plays") or {}).get("allPlays") or [])
         refreshed_play = next((p for p in plays if build_play_id(game["gamePk"], p) == play_id), None)
+
         if not refreshed_play:
             if play_id in state["pending_near_hr_play_ids"]:
                 state["pending_near_hr_play_ids"].remove(play_id)
-                save_state()
+            processing_near_play_ids.discard(play_id)
+            save_state()
             return
+
         if is_home_run(refreshed_play):
             if play_id in state["pending_near_hr_play_ids"]:
                 state["pending_near_hr_play_ids"].remove(play_id)
-            if play_id not in state["seen_hr_play_ids"]:
+
+            if not already_seen_or_claim("seen_hr_play_ids", play_id):
                 await send_alert(channel, game, refreshed_play, "hr", plays)
-                state["seen_hr_play_ids"].append(play_id)
+
+            processing_near_play_ids.discard(play_id)
             save_state()
             return
+
         if is_near_hr(refreshed_play):
             if play_id in state["pending_near_hr_play_ids"]:
                 state["pending_near_hr_play_ids"].remove(play_id)
-            if play_id not in state["seen_near_hr_play_ids"]:
+
+            if not already_seen_or_claim("seen_near_hr_play_ids", play_id):
                 await send_alert(channel, game, refreshed_play, "near", plays)
-                state["seen_near_hr_play_ids"].append(play_id)
+
+            processing_near_play_ids.discard(play_id)
             save_state()
             return
+
         if play_id in state["pending_near_hr_play_ids"]:
             state["pending_near_hr_play_ids"].remove(play_id)
+
+        processing_near_play_ids.discard(play_id)
         save_state()
+
     except Exception as exc:
         log.warning("Error confirming near HR %s: %s", play_id, exc)
         if play_id in state["pending_near_hr_play_ids"]:
             state["pending_near_hr_play_ids"].remove(play_id)
+        processing_near_play_ids.discard(play_id)
         save_state()
-
-
-
-
-# =========================
-# ODDS API: MORE HR FOLLOW-UP
-# =========================
-
-SPORTSBOOK_LINKS = {
-    "draftkings": "https://sportsbook.draftkings.com/",
-    "fanduel": "https://sportsbook.fanduel.com/",
-    "betmgm": "https://sports.betmgm.com/",
-    "caesars": "https://www.caesars.com/sportsbook-and-casino",
-    "betrivers": "https://www.betrivers.com/",
-    "fanatics": "https://sportsbook.fanatics.com/",
-    "espnbet": "https://espnbet.com/",
-    "bet365": "https://www.bet365.com/",
-}
-
-
-def normalize_text(value: str) -> str:
-    return "".join(ch for ch in (value or "").lower() if ch.isalnum())
-
-
-def normalize_player_name(value: str) -> str:
-    return " ".join((value or "").lower().replace(".", "").replace("'", "").split())
-
-
-def format_american_odds(price):
-    if price is None:
-        return "N/A"
-
-    try:
-        price = int(price)
-    except Exception:
-        return str(price)
-
-    return f"+{price}" if price > 0 else str(price)
-
-
-def american_to_decimal(price):
-    try:
-        price = int(price)
-    except Exception:
-        return None
-
-    if price > 0:
-        return 1 + (price / 100)
-
-    return 1 + (100 / abs(price))
-
-
-def combined_american_odds(prices):
-    decimal_total = 1.0
-
-    for price in prices:
-        dec = american_to_decimal(price)
-        if dec is None:
-            return None
-        decimal_total *= dec
-
-    if decimal_total >= 2:
-        return round((decimal_total - 1) * 100)
-
-    return round(-100 / (decimal_total - 1))
-
-
-def get_bet_link_from_node(*nodes):
-    """
-    The Odds API includeLinks=true can add links on bookmaker / market / outcome nodes.
-    This helper tries common shapes safely.
-    """
-    for node in nodes:
-        if not isinstance(node, dict):
-            continue
-
-        direct = node.get("link")
-        if isinstance(direct, str) and direct:
-            return direct
-
-        links = node.get("links")
-        if isinstance(links, dict):
-            for key in ("bet", "betslip", "market", "event", "desktop", "mobile", "web"):
-                value = links.get(key)
-                if isinstance(value, str) and value:
-                    return value
-
-        if isinstance(links, str) and links:
-            return links
-
-    return ""
-
-
-
-def get_odds_json(url: str, params: dict) -> dict:
-    response = session.get(url, params=params, timeout=25)
-    response.raise_for_status()
-    return response.json()
-
-
-def odds_bookmaker_filter_params():
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "regions": ODDS_REGION,
-        "oddsFormat": ODDS_FORMAT,
-    }
-
-    if ODDS_BOOKMAKERS.strip():
-        params["bookmakers"] = ODDS_BOOKMAKERS.strip()
-
-    return params
-
-
-def fetch_today_odds_events():
-    """
-    Gets today's MLB odds event IDs from The Odds API.
-    Uses h2h only to find events cheaply, then event endpoint for player props.
-    """
-    if not ODDS_API_KEY:
-        return []
-
-    params = odds_bookmaker_filter_params()
-    params["markets"] = "h2h"
-
-    url = f"{ODDS_API_BASE}/sports/{ODDS_SPORT_KEY}/odds"
-    return get_odds_json(url, params=params)
-
-
-def team_names_match(mlb_name: str, odds_name: str) -> bool:
-    mlb_norm = normalize_text(mlb_name)
-    odds_norm = normalize_text(odds_name)
-
-    if not mlb_norm or not odds_norm:
-        return False
-
-    return mlb_norm in odds_norm or odds_norm in mlb_norm
-
-
-def find_odds_event_id_for_mlb_game(game):
-    """
-    Match MLB Stats API game to The Odds API event by team names.
-    """
-    away = game.get("away") or {}
-    home = game.get("home") or {}
-
-    mlb_away_names = [
-        away.get("name"),
-        away.get("teamName"),
-        away.get("clubName"),
-        away.get("abbreviation"),
-    ]
-    mlb_home_names = [
-        home.get("name"),
-        home.get("teamName"),
-        home.get("clubName"),
-        home.get("abbreviation"),
-    ]
-
-    try:
-        events = fetch_today_odds_events()
-    except Exception as exc:
-        log.warning("Could not load Odds API events: %s", exc)
-        return None
-
-    for event in events:
-        odds_home = event.get("home_team", "")
-        odds_away = event.get("away_team", "")
-
-        away_match = any(team_names_match(name, odds_away) for name in mlb_away_names if name)
-        home_match = any(team_names_match(name, odds_home) for name in mlb_home_names if name)
-
-        # Some APIs/books can flip display order, so allow reversed as fallback.
-        away_reverse = any(team_names_match(name, odds_home) for name in mlb_away_names if name)
-        home_reverse = any(team_names_match(name, odds_away) for name in mlb_home_names if name)
-
-        if (away_match and home_match) or (away_reverse and home_reverse):
-            return event.get("id")
-
-    return None
-
-
-def fetch_event_more_hr_odds(event_id: str):
-    if not ODDS_API_KEY or not event_id:
-        return {}
-
-    params = odds_bookmaker_filter_params()
-    params["markets"] = "batter_home_runs_alternate"
-
-    url = f"{ODDS_API_BASE}/sports/{ODDS_SPORT_KEY}/events/{event_id}/odds"
-    return get_odds_json(url, params=params)
-
-
-def parse_more_hr_odds_for_player(event_odds: dict, player_name: str, target_point: float):
-    """
-    Finds Over 1.5 or Over 2.5 HR in batter_home_runs_alternate.
-
-    Expected player prop shape from The Odds API:
-    outcome.name = "Over"
-    outcome.description = player name
-    outcome.point = 1.5 / 2.5
-    """
-    target_player = normalize_player_name(player_name)
-    found = []
-
-    for bookmaker in event_odds.get("bookmakers", []):
-        book_key = bookmaker.get("key", "")
-        book_title = bookmaker.get("title") or bookmaker.get("key") or "Book"
-
-        for market in bookmaker.get("markets", []):
-            if market.get("key") != "batter_home_runs_alternate":
-                continue
-
-            for outcome in market.get("outcomes", []):
-                outcome_name = outcome.get("name", "")
-                outcome_desc = outcome.get("description", "")
-                point = outcome.get("point")
-                price = outcome.get("price")
-
-                # Normal expected form: name=Over, description=Player
-                is_over = str(outcome_name).lower() == "over"
-                player_match = normalize_player_name(outcome_desc) == target_player
-
-                # Robust fallback: sometimes player-like text could be in name.
-                fallback_player_match = normalize_player_name(outcome_name) == target_player and str(outcome_desc).lower() == "over"
-
-                try:
-                    point_match = float(point) == float(target_point)
-                except Exception:
-                    point_match = False
-
-                if point_match and price is not None and ((is_over and player_match) or fallback_player_match):
-                    found.append({
-                        "book_key": book_key,
-                        "book_title": book_title,
-                        "price": price,
-                        "link": SPORTSBOOK_LINKS.get(book_key, ""),
-                    })
-
-    # Best plus price first
-    found.sort(key=lambda x: int(x["price"]) if isinstance(x["price"], int) or str(x["price"]).lstrip("-").isdigit() else -9999, reverse=True)
-    return found
-
-
-async def send_more_hr_odds_after_delay(channel, game, player_name: str, player_id, current_hr_count: int):
-    """
-    Sends delayed follow-up:
-    - after 1 HR: Over 1.5 HR odds
-    - after 2 HR: Over 2.5 HR odds
-    """
-    if not ENABLE_MORE_HR_ODDS:
-        return
-
-    if not ODDS_API_KEY:
-        log.info("ENABLE_MORE_HR_ODDS is true but ODDS_API_KEY is missing")
-        return
-
-    if current_hr_count not in (1, 2):
-        return
-
-    odds_key = f"{game.get('gamePk')}-{player_id or player_name}-{current_hr_count}"
-    if odds_key in state["seen_more_hr_odds_keys"]:
-        return
-
-    state["seen_more_hr_odds_keys"].append(odds_key)
-    save_state()
-
-    await asyncio.sleep(MORE_HR_ODDS_DELAY_SECONDS)
-
-    target_point = 1.5 if current_hr_count == 1 else 2.5
-    target_total = 2 if current_hr_count == 1 else 3
-    title_emoji = "🔁" if current_hr_count == 1 else "🚨"
-    title = f"{title_emoji} {target_total}-HR Game Odds — {player_name}"
-
-    try:
-        event_id = await asyncio.to_thread(find_odds_event_id_for_mlb_game, game)
-        if not event_id:
-            log.info("Could not match MLB game to Odds API event for %s", game_label(game))
-            return
-
-        event_odds = await asyncio.to_thread(fetch_event_more_hr_odds, event_id)
-        rows = parse_more_hr_odds_for_player(event_odds, player_name, target_point)
-
-    except Exception as exc:
-        log.warning("Could not fetch more HR odds for %s: %s", player_name, exc)
-        return
-
-    if len(rows) < MORE_HR_MIN_BOOKS:
-        log.info("Not enough books reposted %s over %.1f HR odds. Found %s", player_name, target_point, len(rows))
-        return
-
-    lines = []
-    link_lines = []
-
-    for row in rows[:6]:
-        lines.append(f"• {row['book_title']}: **{format_american_odds(row['price'])}**")
-        if row.get("link"):
-            link_lines.append(f"[{row['book_title']}]({row['link']})")
-
-    description = f"**Over {target_point} HR / {target_total}+ HR Game**\n" + "\n".join(lines)
-
-    if link_lines:
-        description += "\n\n**Sportsbook links:**\n" + " • ".join(link_lines[:6])
-
-    embed = discord.Embed(
-        title=title,
-        description=description,
-        color=discord.Color.green(),
-        url=f"https://www.mlb.com/gameday/{game['gamePk']}",
-    )
-    embed.set_footer(text=f"Delayed {MORE_HR_ODDS_DELAY_SECONDS}s to let books repost live alt-HR markets")
-
-    await channel.send(embed=embed)
-
-
-
-# =========================
-# NO HR THROUGH 3 ROAST ALERTS
-# =========================
-
-NO_HR_THROUGH_3_MESSAGES = [
-    "The home run slips are currently in witness protection.",
-    "Everyone who bet a homer is now staring at the TV like it owes them money.",
-    "Three innings in and the ball still hasn’t filed a flight plan.",
-    "The bats are giving warning-track energy only.",
-    "HR bettors are already negotiating with the baseball gods.",
-    "No homers yet. The sportsbook intern is feeling very safe.",
-    "The wind is apparently working for the books today.",
-    "Three innings, zero bombs. Pain.",
-    "The balls are staying in the yard like rent is affordable there.",
-    "Power hitters are currently loading... very slowly.",
-    "The HR props are sweating less than we are.",
-    "Somebody tell the bats this is not a contact-hitting support group.",
-    "At this point, the baseballs are asking for PTO.",
-    "No bombs yet. Just vibes and bad tickets.",
-    "The warning track is getting more action than our HR slips.",
-    "Three innings in and the bats are still in airplane mode.",
-]
-
-
-def game_has_any_hr(plays):
-    return any(is_home_run(play) for play in plays)
-
-
-def game_reached_end_of_3rd(plays):
-    """
-    True once the game has reached the 4th inning.
-    That means 3 full innings have completed.
-    """
-    for play in plays:
-        about = play.get("about", {}) or {}
-        inning = about.get("inning")
-
-        if isinstance(inning, int) and inning >= 4:
-            return True
-
-    return False
-
-
-async def maybe_send_no_hr_3rd_alert(channel, game, plays):
-    if not ENABLE_NO_HR_THROUGH_3_ALERT:
-        return
-
-    game_pk = game.get("gamePk")
-    if not game_pk:
-        return
-
-    game_key = str(game_pk)
-
-    if game_key in state["seen_no_hr_3rd_game_ids"]:
-        return
-
-    if not game_reached_end_of_3rd(plays):
-        return
-
-    if game_has_any_hr(plays):
-        return
-
-    msg = random.choice(NO_HR_THROUGH_3_MESSAGES)
-
-    embed = discord.Embed(
-        title="🫠 No HR Through 3",
-        description=f"**{game_label(game)}**\n\n{msg}",
-        color=discord.Color.dark_grey(),
-    )
-    embed.set_footer(text="HR bettors support group checking in")
-
-    await channel.send(embed=embed)
-
-    state["seen_no_hr_3rd_game_ids"].append(game_key)
-    save_state()
 
 
 async def process_game(channel, game):
@@ -786,19 +449,48 @@ async def process_game(channel, game):
     plays = (((data.get("liveData") or {}).get("plays") or {}).get("allPlays") or [])
 
     await maybe_send_no_hr_3rd_alert(channel, game, plays)
+
     for play in plays:
+        if "play_is_recent" in globals() and not play_is_recent(play):
+            continue
+
         pid = build_play_id(game["gamePk"], play)
+
         if is_home_run(play):
-            if pid not in state["seen_hr_play_ids"]:
+            if pid in processing_play_ids:
+                continue
+
+            # Claim BEFORE sending. This prevents duplicate loops/reconnects from posting same HR.
+            if already_seen_or_claim("seen_hr_play_ids", pid):
+                continue
+
+            processing_play_ids.add(pid)
+            try:
                 await send_alert(channel, game, play, "hr", plays)
-                state["seen_hr_play_ids"].append(pid)
+            finally:
+                processing_play_ids.discard(pid)
+
             if pid in state["pending_near_hr_play_ids"]:
                 state["pending_near_hr_play_ids"].remove(pid)
+                save_state()
+
             continue
+
         if is_near_hr(play):
-            if pid not in state["seen_near_hr_play_ids"] and pid not in state["pending_near_hr_play_ids"] and pid not in state["seen_hr_play_ids"]:
-                state["pending_near_hr_play_ids"].append(pid)
-                asyncio.create_task(confirm_and_send_near_hr(channel, game, pid))
+            if (
+                pid in processing_near_play_ids
+                or pid in state["seen_near_hr_play_ids"]
+                or pid in state["pending_near_hr_play_ids"]
+                or pid in state["seen_hr_play_ids"]
+            ):
+                continue
+
+            processing_near_play_ids.add(pid)
+            state["pending_near_hr_play_ids"].append(pid)
+            save_state()
+
+            asyncio.create_task(confirm_and_send_near_hr(channel, game, pid))
+
     save_state()
 
 
@@ -1716,10 +1408,20 @@ async def loop():
 
 @client.event
 async def on_ready():
-    global loop_task
+    global loop_task, live_loop_started
+
     log.info("Bot ready as %s", client.user)
     log.info("Schedule set for %s:%02d %s", DAILY_RECAP_HOUR, DAILY_RECAP_MINUTE, TIMEZONE)
     log.info("Redeploy protection: skip_old_plays=%s max_minutes=%s", SKIP_OLD_PLAYS_ON_STARTUP, OLD_PLAY_MAX_MINUTES)
+
+    # discord.py may fire on_ready more than once after reconnects.
+    # This prevents duplicate polling loops inside one Railway container.
+    if live_loop_started:
+        log.info("Live alert loop already started; skipping duplicate startup")
+        return
+
+    live_loop_started = True
+
     if loop_task is None or loop_task.done():
         loop_task = client.loop.create_task(loop())
         log.info("Started live alert loop")
