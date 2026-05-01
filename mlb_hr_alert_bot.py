@@ -12,6 +12,10 @@ from zoneinfo import ZoneInfo
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
+DISCORD_STRIKEOUT_CHANNEL_ID = int(os.getenv("DISCORD_STRIKEOUT_CHANNEL_ID", "0"))
+ENABLE_STRIKEOUT_ALERTS = os.getenv("ENABLE_STRIKEOUT_ALERTS", "false").lower() == "true"
+STRIKEOUT_ALERT_MIN_KS = int(os.getenv("STRIKEOUT_ALERT_MIN_KS", "3"))
+STRIKEOUT_ALERT_MAX_INNING = int(os.getenv("STRIKEOUT_ALERT_MAX_INNING", "2"))
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "15"))
 TIMEZONE = os.getenv("TIMEZONE", "America/Chicago")
 REPORT_BUILD_TIMEOUT_SECONDS = int(os.getenv("REPORT_BUILD_TIMEOUT_SECONDS", "120"))
@@ -89,6 +93,7 @@ state = {
     "last_startup_date": None,
     "last_daily_recap_date": None,
     "last_schedule_check_minute": None,
+    "seen_strikeout_alerts": [],
     "seen_no_hr_3rd_game_ids": [],
     "seen_more_hr_odds_keys": [],
 }
@@ -133,6 +138,7 @@ def load_state():
     state.setdefault("last_startup_date", None)
     state.setdefault("last_daily_recap_date", None)
     state.setdefault("last_schedule_check_minute", None)
+    state.setdefault("seen_strikeout_alerts", [])
     state.setdefault("seen_no_hr_3rd_game_ids", [])
     state.setdefault("seen_more_hr_odds_keys", [])
 
@@ -141,6 +147,7 @@ def save_state():
     state["seen_hr_play_ids"] = state["seen_hr_play_ids"][-500:]
     state["seen_near_hr_play_ids"] = state["seen_near_hr_play_ids"][-1000:]
     state["pending_near_hr_play_ids"] = state["pending_near_hr_play_ids"][-1000:]
+    state["seen_strikeout_alerts"] = state.get("seen_strikeout_alerts", [])[-500:]
     for extra_key in ("seen_no_hr_3rd_game_ids", "seen_more_hr_odds_keys", "seen_pregame_parlay_game_ids"):
         if extra_key in state:
             state[extra_key] = state[extra_key][-500:]
@@ -525,9 +532,138 @@ async def maybe_send_no_hr_3rd_alert(channel, game, plays):
     save_state()
 
 
+
+# =========================
+# STRIKEOUT ALERTS
+# =========================
+
+def innings_pitched_to_float(value):
+    """Convert MLB innings notation. 1.1 = 1 and 1/3, 1.2 = 1 and 2/3."""
+    if value in (None, ""):
+        return 0.0
+
+    try:
+        text = str(value)
+
+        if "." not in text:
+            return float(text)
+
+        whole, frac = text.split(".", 1)
+        whole_num = int(whole or 0)
+
+        if frac == "1":
+            return whole_num + (1 / 3)
+
+        if frac == "2":
+            return whole_num + (2 / 3)
+
+        return float(text)
+    except Exception:
+        return 0.0
+
+
+def get_current_game_inning_from_feed(feed_data):
+    linescore = ((feed_data.get("liveData") or {}).get("linescore") or {})
+    inning = linescore.get("currentInning")
+
+    try:
+        return int(inning)
+    except Exception:
+        return None
+
+
+def collect_early_strikeout_pitchers(game, feed_data):
+    current_inning = get_current_game_inning_from_feed(feed_data)
+
+    if current_inning is None or current_inning > STRIKEOUT_ALERT_MAX_INNING:
+        return []
+
+    boxscore = ((feed_data.get("liveData") or {}).get("boxscore") or {})
+    teams = boxscore.get("teams") or {}
+    found = []
+
+    for side in ("away", "home"):
+        team_block = teams.get(side) or {}
+        team_info = team_block.get("team") or {}
+        team_abbr = team_info.get("abbreviation") or team_info.get("teamName") or team_info.get("name") or "MLB"
+        players = team_block.get("players") or {}
+
+        for player in players.values():
+            person = player.get("person") or {}
+            pitching = ((player.get("stats") or {}).get("pitching") or {})
+
+            if not pitching:
+                continue
+
+            ks = int(pitching.get("strikeOuts", 0) or 0)
+
+            if ks < STRIKEOUT_ALERT_MIN_KS:
+                continue
+
+            innings_pitched_raw = pitching.get("inningsPitched", "0")
+            innings_pitched = innings_pitched_to_float(innings_pitched_raw)
+
+            if innings_pitched > STRIKEOUT_ALERT_MAX_INNING + 0.99:
+                continue
+
+            found.append({
+                "player_id": person.get("id"),
+                "name": person.get("fullName", "Unknown Pitcher"),
+                "team_abbr": team_abbr,
+                "ks": ks,
+                "innings_pitched": innings_pitched_raw,
+                "current_inning": current_inning,
+                "game": game_label(game),
+                "game_pk": game.get("gamePk"),
+            })
+
+    return found
+
+
+async def maybe_send_strikeout_alerts(channel, game, feed_data):
+    if not ENABLE_STRIKEOUT_ALERTS:
+        return
+
+    target_channel = channel
+
+    if DISCORD_STRIKEOUT_CHANNEL_ID:
+        try:
+            target_channel = await client.fetch_channel(DISCORD_STRIKEOUT_CHANNEL_ID)
+        except Exception as exc:
+            log.warning("Could not fetch strikeout channel %s: %s", DISCORD_STRIKEOUT_CHANNEL_ID, exc)
+            target_channel = channel
+
+    pitchers = collect_early_strikeout_pitchers(game, feed_data)
+
+    for pitcher in pitchers:
+        alert_key = f"{pitcher['game_pk']}-{pitcher.get('player_id')}-{STRIKEOUT_ALERT_MIN_KS}ks"
+
+        if alert_key in state["seen_strikeout_alerts"]:
+            continue
+
+        state["seen_strikeout_alerts"].append(alert_key)
+        save_state()
+
+        embed = discord.Embed(
+            title="🔥 Early K Alert",
+            description=(
+                f"**{pitcher['name']} ({pitcher['team_abbr']})**\n"
+                f"{pitcher['ks']} Ks through {pitcher['innings_pitched']} IP\n\n"
+                f"**Game:** {pitcher['game']}"
+            ),
+            color=discord.Color.orange(),
+            url=f"https://www.mlb.com/gameday/{pitcher['game_pk']}",
+        )
+        embed.set_footer(text=f"Trigger: {STRIKEOUT_ALERT_MIN_KS}+ Ks in innings 1-{STRIKEOUT_ALERT_MAX_INNING}")
+
+        await target_channel.send(embed=embed)
+
+
 async def process_game(channel, game):
     data = get_json(LIVE_FEED_URL.format(gamePk=game["gamePk"]))
     plays = (((data.get("liveData") or {}).get("plays") or {}).get("allPlays") or [])
+
+    await maybe_send_strikeout_alerts(channel, game, data)
 
     await maybe_send_no_hr_3rd_alert(channel, game, plays)
 
@@ -1715,6 +1851,7 @@ async def on_ready():
         log.info("No HR through 3 alert enabled: %s", ENABLE_NO_HR_THROUGH_3_ALERT)
         log.info("More HR odds enabled: %s", ENABLE_MORE_HR_ODDS)
         log.info("Morning HR parlays enabled: %s", ENABLE_MORNING_HR_PARLAYS)
+        log.info("Strikeout alerts enabled: %s channel=%s", ENABLE_STRIKEOUT_ALERTS, DISCORD_STRIKEOUT_CHANNEL_ID or "main")
     else:
         log.info("Live alert loop already running")
 
@@ -1791,6 +1928,13 @@ async def on_message(message):
             await message.channel.send("Could not load birthday data right now.")
             return
         await send_birthday_embed(message.channel, birthday_narratives)
+    elif content == "!ktest":
+        await message.channel.send(
+            f"Strikeout alerts: enabled={ENABLE_STRIKEOUT_ALERTS}, "
+            f"channel_id={DISCORD_STRIKEOUT_CHANNEL_ID or 'main'}, "
+            f"trigger={STRIKEOUT_ALERT_MIN_KS}+ Ks by inning {STRIKEOUT_ALERT_MAX_INNING}"
+        )
+
     elif content == "!ping":
         await message.channel.send("pong")
 
