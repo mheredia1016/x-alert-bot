@@ -40,6 +40,7 @@ MORE_HR_MIN_BOOKS = int(os.getenv("MORE_HR_MIN_BOOKS", "1"))
 ODDS_REGION = os.getenv("ODDS_REGION", "us")
 ODDS_FORMAT = os.getenv("ODDS_FORMAT", "american")
 ODDS_BOOKMAKERS = os.getenv("ODDS_BOOKMAKERS", "draftkings,fanduel,betmgm")
+ODDS_CACHE_MINUTES = int(os.getenv("ODDS_CACHE_MINUTES", "60"))
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 ODDS_SPORT_KEY = "baseball_mlb"
 
@@ -71,6 +72,7 @@ loop_task = None
 live_loop_started = False
 processing_play_ids = set()
 processing_near_play_ids = set()
+morning_hr_odds_cache = {"fetched_at": None, "rows": []}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("mlb_hr_alert_bot")
@@ -1283,6 +1285,44 @@ def get_bet_link_from_node(*nodes):
     return ""
 
 
+
+# =========================
+# ODDS CACHE HELPERS
+# =========================
+
+def odds_cache_is_fresh():
+    fetched_at = morning_hr_odds_cache.get("fetched_at")
+
+    if not fetched_at:
+        return False
+
+    age_seconds = (datetime.now(TZ) - fetched_at).total_seconds()
+    return age_seconds < ODDS_CACHE_MINUTES * 60
+
+
+def get_cached_morning_hr_odds():
+    if odds_cache_is_fresh():
+        return morning_hr_odds_cache.get("rows", [])
+
+    return None
+
+
+def set_cached_morning_hr_odds(rows):
+    morning_hr_odds_cache["fetched_at"] = datetime.now(TZ)
+    morning_hr_odds_cache["rows"] = rows or []
+
+
+def cache_status_text():
+    fetched_at = morning_hr_odds_cache.get("fetched_at")
+    rows = morning_hr_odds_cache.get("rows", [])
+
+    if not fetched_at:
+        return "No cached HR odds yet."
+
+    age_minutes = int((datetime.now(TZ) - fetched_at).total_seconds() / 60)
+    return f"Cached HR odds: {len(rows)} players, fetched {age_minutes} min ago."
+
+
 # =========================
 # MORNING HR PARLAYS
 # =========================
@@ -1350,11 +1390,18 @@ def parse_best_hr_odds_for_morning(event_odds: dict):
     return list(best.values())
 
 
-def build_today_hr_odds_rows(today_games):
+def build_today_hr_odds_rows(today_games, force_refresh=False):
     """
-    Pulls HR odds for today's MLB games and returns one best-price row per player.
-    Controlled by ODDS_BOOKMAKERS to limit API usage.
+    Cached HR odds fetcher.
+
+    The Odds API player props are event-level, so a refresh can still call once per game.
+    Cache prevents repeated calls from !hrparlays and the morning report.
     """
+    cached = get_cached_morning_hr_odds()
+    if cached is not None and not force_refresh:
+        log.info("Using cached morning HR odds: %s rows", len(cached))
+        return cached
+
     rows_by_player = {}
 
     for game in today_games:
@@ -1378,8 +1425,10 @@ def build_today_hr_odds_rows(today_games):
             log.warning("Could not load morning HR odds for %s: %s", game_label(game), exc)
             continue
 
-    return list(rows_by_player.values())
-
+    final_rows = list(rows_by_player.values())
+    set_cached_morning_hr_odds(final_rows)
+    log.info("Fetched and cached morning HR odds: %s rows", len(final_rows))
+    return final_rows
 
 def build_morning_player_score_lookup(hot_streaks, two_hr_watch):
     lookup = {}
@@ -1597,16 +1646,16 @@ async def send_morning_hr_parlays_embed(channel, hot_streaks, two_hr_watch, toda
         return
 
     try:
-        odds_rows = await asyncio.to_thread(build_today_hr_odds_rows, today_games)
+        odds_rows = await asyncio.to_thread(build_today_hr_odds_rows, today_games, False)
         parlays = await asyncio.to_thread(build_best_morning_hr_parlays, hot_streaks, two_hr_watch, odds_rows)
 
     except Exception as exc:
         log.warning("Could not build morning HR parlays: %s", exc)
-        await channel.send("💣 **Best HR Parlays Today**\nCould not load HR odds right now.")
+        await channel.send(f"💣 **Best HR Parlays Today**\nCould not load HR odds right now.\n`{type(exc).__name__}: {exc}`")
         return
 
     if not any(parlays.values()):
-        await channel.send("💣 **Best HR Parlays Today**\nNo sportsbook HR lines available yet.")
+        await channel.send(f"💣 **Best HR Parlays Today**\nNo sportsbook HR lines available yet.\n{cache_status_text()}")
         return
 
     embed = discord.Embed(
@@ -1706,8 +1755,21 @@ async def on_message(message):
             f"Odds debug: key_set={bool(ODDS_API_KEY)}, get_odds_json_exists={'get_odds_json' in globals()}, books={ODDS_BOOKMAKERS}"
         )
 
+    elif content == "!oddscache":
+        await message.channel.send(cache_status_text())
+
+    elif content == "!refreshhrparlays":
+        await message.channel.send("Refreshing HR odds cache once...")
+        try:
+            today_games = await asyncio.to_thread(get_today_games)
+            odds_rows = await asyncio.to_thread(build_today_hr_odds_rows, today_games, True)
+            await message.channel.send(f"Refreshed HR odds cache: {len(odds_rows)} player lines.")
+        except Exception as exc:
+            log.exception("Refresh HR parlays failed: %s", exc)
+            await message.channel.send(f"Could not refresh HR odds cache: `{type(exc).__name__}: {exc}`")
+
     elif content == "!hrparlays":
-        await message.channel.send("Building today’s best HR parlays...")
+        await message.channel.send("Building today’s best HR parlays... using cached odds when available.")
         try:
             hot_streaks = await asyncio.to_thread(build_hot_streaks)
             today_games = await asyncio.to_thread(get_today_games)
