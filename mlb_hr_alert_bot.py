@@ -444,6 +444,78 @@ async def confirm_and_send_near_hr(channel, game, play_id):
         save_state()
 
 
+
+# =========================
+# NO HR THROUGH 3 ROAST ALERTS
+# =========================
+
+NO_HR_THROUGH_3_MESSAGES = [
+    "The home run slips are currently in witness protection.",
+    "Everyone who bet a homer is now staring at the TV like it owes them money.",
+    "Three innings in and the ball still hasn’t filed a flight plan.",
+    "The bats are giving warning-track energy only.",
+    "HR bettors are already negotiating with the baseball gods.",
+    "No homers yet. The sportsbook intern is feeling very safe.",
+    "The wind is apparently working for the books today.",
+    "Three innings, zero bombs. Pain.",
+    "The balls are staying in the yard like rent is affordable there.",
+    "Power hitters are currently loading... very slowly.",
+    "The HR props are sweating less than we are.",
+    "Somebody tell the bats this is not a contact-hitting support group.",
+]
+
+
+def game_has_any_hr(plays):
+    return any(is_home_run(play) for play in plays)
+
+
+def game_reached_end_of_3rd(plays):
+    for play in plays:
+        about = play.get("about", {}) or {}
+        inning = about.get("inning")
+
+        if isinstance(inning, int) and inning >= 4:
+            return True
+
+    return False
+
+
+async def maybe_send_no_hr_3rd_alert(channel, game, plays):
+    if not ENABLE_NO_HR_THROUGH_3_ALERT:
+        return
+
+    game_pk = game.get("gamePk")
+    if not game_pk:
+        return
+
+    game_key = str(game_pk)
+
+    state.setdefault("seen_no_hr_3rd_game_ids", [])
+
+    if game_key in state["seen_no_hr_3rd_game_ids"]:
+        return
+
+    if not game_reached_end_of_3rd(plays):
+        return
+
+    if game_has_any_hr(plays):
+        return
+
+    msg = random.choice(NO_HR_THROUGH_3_MESSAGES)
+
+    embed = discord.Embed(
+        title="🫠 No HR Through 3",
+        description=f"**{game_label(game)}**\n\n{msg}",
+        color=discord.Color.dark_grey(),
+    )
+    embed.set_footer(text="HR bettors support group checking in")
+
+    await channel.send(embed=embed)
+
+    state["seen_no_hr_3rd_game_ids"].append(game_key)
+    save_state()
+
+
 async def process_game(channel, game):
     data = get_json(LIVE_FEED_URL.format(gamePk=game["gamePk"]))
     plays = (((data.get("liveData") or {}).get("plays") or {}).get("allPlays") or [])
@@ -1043,6 +1115,165 @@ async def maybe_run_scheduled_daily_recap():
         log.info("Scheduled daily recap trigger fired at %s", now.isoformat())
         await post_daily_hr_recap(force=False)
 
+
+
+
+# =========================
+# ODDS EVENT MATCHING HELPERS
+# =========================
+
+SPORTSBOOK_LINKS = {
+    "draftkings": "https://sportsbook.draftkings.com/",
+    "fanduel": "https://sportsbook.fanduel.com/",
+    "betmgm": "https://sports.betmgm.com/",
+    "caesars": "https://www.caesars.com/sportsbook-and-casino",
+    "betrivers": "https://www.betrivers.com/",
+    "fanatics": "https://sportsbook.fanatics.com/",
+    "espnbet": "https://espnbet.com/",
+    "bet365": "https://www.bet365.com/",
+}
+
+
+def normalize_text(value: str) -> str:
+    return "".join(ch for ch in (value or "").lower() if ch.isalnum())
+
+
+def normalize_player_name(value: str) -> str:
+    return " ".join((value or "").lower().replace(".", "").replace("'", "").split())
+
+
+def format_american_odds(price):
+    if price is None:
+        return "N/A"
+
+    try:
+        price = int(price)
+    except Exception:
+        return str(price)
+
+    return f"+{price}" if price > 0 else str(price)
+
+
+def odds_bookmaker_filter_params():
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": ODDS_REGION,
+        "oddsFormat": ODDS_FORMAT,
+    }
+
+    if ODDS_BOOKMAKERS.strip():
+        params["bookmakers"] = ODDS_BOOKMAKERS.strip()
+
+    return params
+
+
+def fetch_today_odds_events():
+    if not ODDS_API_KEY:
+        return []
+
+    params = odds_bookmaker_filter_params()
+    params["markets"] = "h2h"
+
+    url = f"{ODDS_API_BASE}/sports/{ODDS_SPORT_KEY}/odds"
+    return get_odds_json(url, params=params)
+
+
+def team_names_match(mlb_name: str, odds_name: str) -> bool:
+    mlb_norm = normalize_text(mlb_name)
+    odds_norm = normalize_text(odds_name)
+
+    if not mlb_norm or not odds_norm:
+        return False
+
+    return mlb_norm in odds_norm or odds_norm in mlb_norm
+
+
+def find_odds_event_id_for_mlb_game(game):
+    away = game.get("away") or {}
+    home = game.get("home") or {}
+
+    mlb_away_names = [
+        away.get("name"),
+        away.get("teamName"),
+        away.get("clubName"),
+        away.get("abbreviation"),
+    ]
+    mlb_home_names = [
+        home.get("name"),
+        home.get("teamName"),
+        home.get("clubName"),
+        home.get("abbreviation"),
+    ]
+
+    try:
+        events = fetch_today_odds_events()
+    except Exception as exc:
+        log.warning("Could not load Odds API events: %s", exc)
+        return None
+
+    for event in events:
+        odds_home = event.get("home_team", "")
+        odds_away = event.get("away_team", "")
+
+        away_match = any(team_names_match(name, odds_away) for name in mlb_away_names if name)
+        home_match = any(team_names_match(name, odds_home) for name in mlb_home_names if name)
+
+        away_reverse = any(team_names_match(name, odds_home) for name in mlb_away_names if name)
+        home_reverse = any(team_names_match(name, odds_away) for name in mlb_home_names if name)
+
+        if (away_match and home_match) or (away_reverse and home_reverse):
+            return event.get("id")
+
+    return None
+
+
+def american_to_decimal(price):
+    try:
+        price = int(price)
+    except Exception:
+        return None
+
+    if price > 0:
+        return 1 + (price / 100)
+
+    return 1 + (100 / abs(price))
+
+
+def combined_american_odds(prices):
+    decimal_total = 1.0
+
+    for price in prices:
+        dec = american_to_decimal(price)
+        if dec is None:
+            return None
+        decimal_total *= dec
+
+    if decimal_total >= 2:
+        return round((decimal_total - 1) * 100)
+
+    return round(-100 / (decimal_total - 1))
+
+
+def get_bet_link_from_node(*nodes):
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+
+        direct = node.get("link")
+        if isinstance(direct, str) and direct:
+            return direct
+
+        links = node.get("links")
+        if isinstance(links, dict):
+            for key in ("bet", "betslip", "market", "event", "desktop", "mobile", "web"):
+                value = links.get(key)
+                if isinstance(value, str) and value:
+                    return value
+
+        if isinstance(links, str) and links:
+            return links
+
+    return ""
 
 
 # =========================
