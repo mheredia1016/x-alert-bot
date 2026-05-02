@@ -603,6 +603,7 @@ def collect_early_strikeout_pitchers(game, feed_data):
                 continue
 
             ks = int(pitching.get("strikeOuts", 0) or 0)
+            pitch_count = int(pitching.get("pitchesThrown", 0) or 0)
 
             if ks < STRIKEOUT_ALERT_MIN_KS:
                 continue
@@ -619,6 +620,7 @@ def collect_early_strikeout_pitchers(game, feed_data):
                 "team_abbr": team_abbr,
                 "ks": ks,
                 "innings_pitched": innings_pitched_raw,
+                "pitch_count": pitch_count,
                 "current_inning": current_inning,
                 "game": game_label(game),
                 "game_pk": game.get("gamePk"),
@@ -655,7 +657,8 @@ async def maybe_send_strikeout_alerts(channel, game, feed_data):
             title="🔥 Early K Alert",
             description=(
                 f"**{pitcher['name']} ({pitcher['team_abbr']})**\n"
-                f"{pitcher['ks']} Ks through {pitcher['innings_pitched']} IP\n\n"
+                f"{pitcher['ks']} Ks through {pitcher['innings_pitched']} IP\n"
+                f"Pitch Count: {pitcher.get('pitch_count', 'N/A')}\n\n"
                 f"**Game:** {pitcher['game']}"
             ),
             color=discord.Color.orange(),
