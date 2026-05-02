@@ -25,6 +25,7 @@ DISABLE_STARTUP_MESSAGE = os.getenv("DISABLE_STARTUP_MESSAGE", "false").lower() 
 
 DAILY_RECAP_HOUR = int(os.getenv("DAILY_RECAP_HOUR", "8"))
 DAILY_RECAP_MINUTE = int(os.getenv("DAILY_RECAP_MINUTE", "0"))
+DAILY_RECAP_CATCHUP_HOURS = int(os.getenv("DAILY_RECAP_CATCHUP_HOURS", "6"))
 HOT_STREAK_DAYS = int(os.getenv("HOT_STREAK_DAYS", "7"))
 HOT_STREAK_TOP_N = int(os.getenv("HOT_STREAK_TOP_N", "8"))
 
@@ -77,6 +78,7 @@ live_loop_started = False
 processing_play_ids = set()
 processing_near_play_ids = set()
 morning_hr_odds_cache = {"fetched_at": None, "rows": []}
+daily_recap_running = False
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("mlb_hr_alert_bot")
@@ -398,7 +400,12 @@ async def send_alert(channel, game, play, alert_type, all_plays=None):
     embed.set_footer(text="MLB live feed")
     await channel.send(embed=embed)
 
-    if alert_type == "hr" and hr_number in (1, 2):
+    if (
+        alert_type == "hr"
+        and hr_number in (1, 2)
+        and ENABLE_MORE_HR_ODDS
+        and "send_more_hr_odds_after_delay" in globals()
+    ):
         asyncio.create_task(
             send_more_hr_odds_after_delay(
                 channel=channel,
@@ -1177,6 +1184,54 @@ def split_lines_into_chunks(header: str, lines: list[str], limit: int = 1900):
     return chunks
 
 
+
+# =========================
+# SAFE FALLBACK EMBEDS / OPTIONAL FEATURES
+# =========================
+
+async def send_hot_streaks_embed(channel, hot_streaks):
+    """
+    Safe fallback in case a previous build references this function.
+    Posts hot streaks without crashing the scheduler.
+    """
+    if not hot_streaks:
+        return
+
+    embed = discord.Embed(
+        title=f"🔥 Hot HR Streaks (Last {HOT_STREAK_DAYS} Days)",
+        color=discord.Color.gold(),
+    )
+
+    for row in hot_streaks[:HOT_STREAK_TOP_N]:
+        streak_days = int(row.get("streak_days", 0) or 0)
+        streak_text = f"{streak_days} straight day" if streak_days == 1 else f"{streak_days} straight days"
+        if streak_days == 0:
+            streak_text = "No current streak"
+
+        embed.add_field(
+            name=f"{row.get('name', 'Unknown')} ({row.get('team_abbr', 'MLB')})",
+            value=f"{row.get('total_hr', 0)} HR last {HOT_STREAK_DAYS} days\n{streak_text}",
+            inline=False,
+        )
+
+    await channel.send(embed=embed)
+
+
+async def send_more_hr_odds_after_delay(*args, **kwargs):
+    """
+    No-op fallback. Keeps HR alerts from crashing if MORE_HR odds are disabled
+    or if the full Odds API follow-up module is not present.
+    """
+    return
+
+
+
+async def safe_send_report_section(section_name, coro):
+    try:
+        await coro
+    except Exception as exc:
+        log.exception("Report section failed: %s: %s", section_name, exc)
+
 async def post_daily_hr_recap(force=False):
     target_date = yesterday_str()
 
@@ -1241,10 +1296,10 @@ async def post_daily_hr_recap(force=False):
         for chunk in split_lines_into_chunks(header, lines):
             await channel.send(chunk)
 
-    await send_hot_streaks_embed(channel, hot_streaks)
-    await send_2hr_watch_embed(channel, two_hr_watch)
-    await send_morning_hr_parlays_embed(channel, hot_streaks, two_hr_watch, today_games)
-    await send_birthday_embed(channel, birthday_narratives)
+    await safe_send_report_section("hot_streaks", send_hot_streaks_embed(channel, hot_streaks))
+    await safe_send_report_section("2hr_watch", send_2hr_watch_embed(channel, two_hr_watch))
+    await safe_send_report_section("morning_hr_parlays", send_morning_hr_parlays_embed(channel, hot_streaks, two_hr_watch, today_games))
+    await safe_send_report_section("birthday", send_birthday_embed(channel, birthday_narratives))
 
     state["last_daily_recap_date"] = target_date
     save_state()
@@ -1252,560 +1307,55 @@ async def post_daily_hr_recap(force=False):
 
 
 async def maybe_run_scheduled_daily_recap():
+    """
+    Robust daily scheduler.
+
+    - Fires once after the scheduled time.
+    - Allows catch-up for DAILY_RECAP_CATCHUP_HOURS.
+    - Claims the report date before building so crashes do not create a spam loop.
+      Manual !yhr can still be used to force rebuild.
+    """
+    global daily_recap_running
+
     now = datetime.now(TZ)
-    schedule_key = now.strftime("%Y-%m-%d-%H-%M")
-    if now.hour == DAILY_RECAP_HOUR and DAILY_RECAP_MINUTE <= now.minute <= DAILY_RECAP_MINUTE + 5 and state.get("last_schedule_check_minute") != schedule_key:
-        state["last_schedule_check_minute"] = schedule_key
-        save_state()
-        log.info("Scheduled daily recap trigger fired at %s", now.isoformat())
+    target_date = yesterday_str()
+
+    if daily_recap_running:
+        return
+
+    if state.get("last_daily_recap_date") == target_date:
+        return
+
+    scheduled = now.replace(
+        hour=DAILY_RECAP_HOUR,
+        minute=DAILY_RECAP_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    catchup_until = scheduled + timedelta(hours=DAILY_RECAP_CATCHUP_HOURS)
+
+    if not (scheduled <= now <= catchup_until):
+        return
+
+    log.info(
+        "Daily recap scheduler firing. now=%s scheduled=%s target_date=%s",
+        now.isoformat(),
+        scheduled.isoformat(),
+        target_date,
+    )
+
+    # Claim date BEFORE build to avoid repeated spam if one section fails.
+    state["last_daily_recap_date"] = target_date
+    save_state()
+
+    daily_recap_running = True
+    try:
         await post_daily_hr_recap(force=False)
-
-
-
-
-# =========================
-# ODDS EVENT MATCHING HELPERS
-# =========================
-
-SPORTSBOOK_LINKS = {
-    "draftkings": "https://sportsbook.draftkings.com/",
-    "fanduel": "https://sportsbook.fanduel.com/",
-    "betmgm": "https://sports.betmgm.com/",
-    "caesars": "https://www.caesars.com/sportsbook-and-casino",
-    "betrivers": "https://www.betrivers.com/",
-    "fanatics": "https://sportsbook.fanatics.com/",
-    "espnbet": "https://espnbet.com/",
-    "bet365": "https://www.bet365.com/",
-}
-
-
-def normalize_text(value: str) -> str:
-    return "".join(ch for ch in (value or "").lower() if ch.isalnum())
-
-
-def normalize_player_name(value: str) -> str:
-    return " ".join((value or "").lower().replace(".", "").replace("'", "").split())
-
-
-def format_american_odds(price):
-    if price is None:
-        return "N/A"
-
-    try:
-        price = int(price)
-    except Exception:
-        return str(price)
-
-    return f"+{price}" if price > 0 else str(price)
-
-
-def odds_bookmaker_filter_params():
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "regions": ODDS_REGION,
-        "oddsFormat": ODDS_FORMAT,
-    }
-
-    if ODDS_BOOKMAKERS.strip():
-        params["bookmakers"] = ODDS_BOOKMAKERS.strip()
-
-    return params
-
-
-def fetch_today_odds_events():
-    if not ODDS_API_KEY:
-        return []
-
-    params = odds_bookmaker_filter_params()
-    params["markets"] = "h2h"
-
-    url = f"{ODDS_API_BASE}/sports/{ODDS_SPORT_KEY}/odds"
-    return get_odds_json(url, params=params)
-
-
-def team_names_match(mlb_name: str, odds_name: str) -> bool:
-    mlb_norm = normalize_text(mlb_name)
-    odds_norm = normalize_text(odds_name)
-
-    if not mlb_norm or not odds_norm:
-        return False
-
-    return mlb_norm in odds_norm or odds_norm in mlb_norm
-
-
-def find_odds_event_id_for_mlb_game(game):
-    away = game.get("away") or {}
-    home = game.get("home") or {}
-
-    mlb_away_names = [
-        away.get("name"),
-        away.get("teamName"),
-        away.get("clubName"),
-        away.get("abbreviation"),
-    ]
-    mlb_home_names = [
-        home.get("name"),
-        home.get("teamName"),
-        home.get("clubName"),
-        home.get("abbreviation"),
-    ]
-
-    try:
-        events = fetch_today_odds_events()
     except Exception as exc:
-        log.warning("Could not load Odds API events: %s", exc)
-        return None
+        log.exception("Scheduled daily recap failed after date claim: %s", exc)
+    finally:
+        daily_recap_running = False
 
-    for event in events:
-        odds_home = event.get("home_team", "")
-        odds_away = event.get("away_team", "")
-
-        away_match = any(team_names_match(name, odds_away) for name in mlb_away_names if name)
-        home_match = any(team_names_match(name, odds_home) for name in mlb_home_names if name)
-
-        away_reverse = any(team_names_match(name, odds_home) for name in mlb_away_names if name)
-        home_reverse = any(team_names_match(name, odds_away) for name in mlb_home_names if name)
-
-        if (away_match and home_match) or (away_reverse and home_reverse):
-            return event.get("id")
-
-    return None
-
-
-def american_to_decimal(price):
-    try:
-        price = int(price)
-    except Exception:
-        return None
-
-    if price > 0:
-        return 1 + (price / 100)
-
-    return 1 + (100 / abs(price))
-
-
-def combined_american_odds(prices):
-    decimal_total = 1.0
-
-    for price in prices:
-        dec = american_to_decimal(price)
-        if dec is None:
-            return None
-        decimal_total *= dec
-
-    if decimal_total >= 2:
-        return round((decimal_total - 1) * 100)
-
-    return round(-100 / (decimal_total - 1))
-
-
-def get_bet_link_from_node(*nodes):
-    for node in nodes:
-        if not isinstance(node, dict):
-            continue
-
-        direct = node.get("link")
-        if isinstance(direct, str) and direct:
-            return direct
-
-        links = node.get("links")
-        if isinstance(links, dict):
-            for key in ("bet", "betslip", "market", "event", "desktop", "mobile", "web"):
-                value = links.get(key)
-                if isinstance(value, str) and value:
-                    return value
-
-        if isinstance(links, str) and links:
-            return links
-
-    return ""
-
-
-
-# =========================
-# ODDS CACHE HELPERS
-# =========================
-
-def odds_cache_is_fresh():
-    fetched_at = morning_hr_odds_cache.get("fetched_at")
-
-    if not fetched_at:
-        return False
-
-    age_seconds = (datetime.now(TZ) - fetched_at).total_seconds()
-    return age_seconds < ODDS_CACHE_MINUTES * 60
-
-
-def get_cached_morning_hr_odds():
-    if odds_cache_is_fresh():
-        return morning_hr_odds_cache.get("rows", [])
-
-    return None
-
-
-def set_cached_morning_hr_odds(rows):
-    morning_hr_odds_cache["fetched_at"] = datetime.now(TZ)
-    morning_hr_odds_cache["rows"] = rows or []
-
-
-def cache_status_text():
-    fetched_at = morning_hr_odds_cache.get("fetched_at")
-    rows = morning_hr_odds_cache.get("rows", [])
-
-    if not fetched_at:
-        return "No cached HR odds yet."
-
-    age_minutes = int((datetime.now(TZ) - fetched_at).total_seconds() / 60)
-    return f"Cached HR odds: {len(rows)} players, fetched {age_minutes} min ago."
-
-
-# =========================
-# MORNING HR PARLAYS
-# =========================
-
-def fetch_event_hr_market_for_morning(event_id: str):
-    if not ODDS_API_KEY or not event_id:
-        return {}
-
-    params = odds_bookmaker_filter_params()
-    params["markets"] = "batter_home_runs"
-    params["includeLinks"] = "true"
-    params["includeSids"] = "true"
-
-    url = f"{ODDS_API_BASE}/sports/{ODDS_SPORT_KEY}/events/{event_id}/odds"
-    return get_odds_json(url, params=params)
-
-
-def parse_best_hr_odds_for_morning(event_odds: dict):
-    """
-    Returns best Over 0.5 HR price per player for one event.
-    """
-    best = {}
-
-    for bookmaker in event_odds.get("bookmakers", []):
-        book_key = bookmaker.get("key", "")
-        book_title = bookmaker.get("title") or bookmaker.get("key") or "Book"
-        book_link = get_bet_link_from_node(bookmaker) or SPORTSBOOK_LINKS.get(book_key, "")
-
-        for market in bookmaker.get("markets", []):
-            if market.get("key") != "batter_home_runs":
-                continue
-
-            market_link = get_bet_link_from_node(market)
-
-            for outcome in market.get("outcomes", []):
-                if str(outcome.get("name", "")).lower() != "over":
-                    continue
-
-                point = outcome.get("point")
-                try:
-                    if point is not None and float(point) != 0.5:
-                        continue
-                except Exception:
-                    pass
-
-                player_name = outcome.get("description")
-                price = outcome.get("price")
-
-                if not player_name or price is None:
-                    continue
-
-                link = get_bet_link_from_node(outcome, market, bookmaker) or market_link or book_link
-                key = normalize_player_name(player_name)
-
-                current = best.get(key)
-                if current is None or int(price) > int(current["price"]):
-                    best[key] = {
-                        "player_name": player_name,
-                        "price": price,
-                        "book_key": book_key,
-                        "book_title": book_title,
-                        "link": link,
-                    }
-
-    return list(best.values())
-
-
-def build_today_hr_odds_rows(today_games, force_refresh=False):
-    """
-    Cached HR odds fetcher.
-
-    The Odds API player props are event-level, so a refresh can still call once per game.
-    Cache prevents repeated calls from !hrparlays and the morning report.
-    """
-    cached = get_cached_morning_hr_odds()
-    if cached is not None and not force_refresh:
-        log.info("Using cached morning HR odds: %s rows", len(cached))
-        return cached
-
-    rows_by_player = {}
-
-    for game in today_games:
-        try:
-            event_id = find_odds_event_id_for_mlb_game(game)
-            if not event_id:
-                continue
-
-            event_odds = fetch_event_hr_market_for_morning(event_id)
-            rows = parse_best_hr_odds_for_morning(event_odds)
-
-            for row in rows:
-                key = normalize_player_name(row["player_name"])
-                current = rows_by_player.get(key)
-
-                if current is None or int(row["price"]) > int(current["price"]):
-                    row["game"] = game_label(game)
-                    rows_by_player[key] = row
-
-        except Exception as exc:
-            log.warning("Could not load morning HR odds for %s: %s", game_label(game), exc)
-            continue
-
-    final_rows = list(rows_by_player.values())
-    set_cached_morning_hr_odds(final_rows)
-    log.info("Fetched and cached morning HR odds: %s rows", len(final_rows))
-    return final_rows
-
-def build_morning_player_score_lookup(hot_streaks, two_hr_watch):
-    lookup = {}
-
-    for row in hot_streaks:
-        key = normalize_player_name(row.get("name", ""))
-        lookup[key] = {
-            "name": row.get("name", ""),
-            "team_abbr": row.get("team_abbr", ""),
-            "last_7_hr": int(row.get("total_hr", 0) or 0),
-            "streak_days": int(row.get("streak_days", 0) or 0),
-            "near_hr_count": 0,
-            "last_hr_ev": None,
-            "max_ev": None,
-            "pitcher_hr9": None,
-            "score": int(row.get("total_hr", 0) or 0) * 12 + int(row.get("streak_days", 0) or 0) * 7,
-        }
-
-    for row in two_hr_watch:
-        key = normalize_player_name(row.get("name", ""))
-        base = lookup.setdefault(key, {
-            "name": row.get("name", ""),
-            "team_abbr": row.get("team_abbr", ""),
-            "last_7_hr": 0,
-            "streak_days": 0,
-            "near_hr_count": 0,
-            "last_hr_ev": None,
-            "max_ev": None,
-            "pitcher_hr9": None,
-            "score": 0,
-        })
-
-        base["team_abbr"] = row.get("team_abbr") or base.get("team_abbr", "")
-        base["near_hr_count"] = int(row.get("near_hr_count", 0) or 0)
-        base["last_hr_ev"] = row.get("last_hr_ev")
-        base["max_ev"] = row.get("max_ev")
-        base["pitcher_hr9"] = row.get("pitcher_hr9")
-        base["score"] = max(base.get("score", 0), int(row.get("score", 0) or 0))
-
-    return lookup
-
-
-def enrich_hr_parlay_candidates(odds_rows, hot_streaks, two_hr_watch):
-    score_lookup = build_morning_player_score_lookup(hot_streaks, two_hr_watch)
-    candidates = []
-
-    for odds in odds_rows:
-        name_key = normalize_player_name(odds.get("player_name", ""))
-        score_data = score_lookup.get(name_key)
-
-        # Still allow players not in hot list, but give them a lower score.
-        if not score_data:
-            score_data = {
-                "team_abbr": "",
-                "last_7_hr": 0,
-                "streak_days": 0,
-                "near_hr_count": 0,
-                "last_hr_ev": None,
-                "max_ev": None,
-                "pitcher_hr9": None,
-                "score": 0,
-            }
-
-        price = int(odds["price"])
-        model_score = float(score_data.get("score", 0) or 0)
-
-        # Odds profile adjustment.
-        # Safe leans to shorter odds; risky/bomb selection will bucket separately.
-        if price <= 350:
-            model_score += 14
-        elif price <= 500:
-            model_score += 10
-        elif price <= 750:
-            model_score += 6
-        else:
-            model_score += 2
-
-        candidates.append({
-            "name": odds["player_name"],
-            "team_abbr": score_data.get("team_abbr", ""),
-            "price": price,
-            "book_title": odds.get("book_title", "Book"),
-            "book_key": odds.get("book_key", ""),
-            "link": odds.get("link", ""),
-            "game": odds.get("game", ""),
-            "last_7_hr": score_data.get("last_7_hr", 0),
-            "streak_days": score_data.get("streak_days", 0),
-            "near_hr_count": score_data.get("near_hr_count", 0),
-            "last_hr_ev": score_data.get("last_hr_ev"),
-            "max_ev": score_data.get("max_ev"),
-            "pitcher_hr9": score_data.get("pitcher_hr9"),
-            "model_score": round(model_score, 1),
-        })
-
-    return candidates
-
-
-def pick_unique_team_legs(pool, max_legs, used_global=None):
-    if used_global is None:
-        used_global = set()
-
-    picked = []
-    used_teams = set()
-
-    for item in pool:
-        team = item.get("team_abbr") or item.get("name")
-        player_key = normalize_player_name(item.get("name", ""))
-
-        if team in used_teams:
-            continue
-
-        if player_key in used_global:
-            continue
-
-        picked.append(item)
-        used_teams.add(team)
-        used_global.add(player_key)
-
-        if len(picked) >= max_legs:
-            break
-
-    # Can be as little as 2. If only one strong leg, still return it rather than forcing junk.
-    return picked
-
-
-def build_best_morning_hr_parlays(hot_streaks, two_hr_watch, odds_rows):
-    candidates = enrich_hr_parlay_candidates(odds_rows, hot_streaks, two_hr_watch)
-
-    if not candidates:
-        return {"safe": [], "risky": [], "bomb": []}
-
-    used_global = set()
-
-    safe_pool = sorted(
-        [c for c in candidates if c["price"] <= 500],
-        key=lambda x: (-x["model_score"], x["price"], x["name"]),
-    )
-
-    risky_pool = sorted(
-        [c for c in candidates if 450 <= c["price"] <= 800],
-        key=lambda x: (-x["model_score"], -x["price"], x["name"]),
-    )
-
-    bomb_pool = sorted(
-        [c for c in candidates if c["price"] >= 650],
-        key=lambda x: (-x["model_score"], -x["price"], x["name"]),
-    )
-
-    all_by_score = sorted(candidates, key=lambda x: (-x["model_score"], x["price"], x["name"]))
-    all_by_price = sorted(candidates, key=lambda x: (-x["price"], -x["model_score"], x["name"]))
-
-    safe = pick_unique_team_legs(
-        safe_pool or all_by_score,
-        max(2, min(4, MORNING_PARLAY_LEGS_SAFE)),
-        used_global,
-    )
-    risky = pick_unique_team_legs(
-        risky_pool or all_by_score,
-        max(2, min(4, MORNING_PARLAY_LEGS_RISKY)),
-        used_global,
-    )
-    bomb = pick_unique_team_legs(
-        bomb_pool or all_by_price,
-        max(2, min(4, MORNING_PARLAY_LEGS_BOMB)),
-        used_global,
-    )
-
-    return {"safe": safe, "risky": risky, "bomb": bomb}
-
-
-def morning_parlay_tier_text(rows):
-    if not rows:
-        return "Not enough quality legs available."
-
-    lines = []
-
-    for row in rows:
-        odds_text = format_american_odds(row["price"])
-        player = row["name"]
-        book = row.get("book_title", "Book")
-        link = row.get("link") or SPORTSBOOK_LINKS.get(row.get("book_key", ""), "")
-
-        stats = []
-        if row.get("last_7_hr"):
-            stats.append(f"{row['last_7_hr']} HR last {HOT_STREAK_DAYS}d")
-        if row.get("near_hr_count"):
-            stats.append(f"{row['near_hr_count']} near-HR last 3g")
-        if row.get("last_hr_ev"):
-            stats.append(f"{row['last_hr_ev']:.1f} EV last HR")
-        elif row.get("max_ev"):
-            stats.append(f"{row['max_ev']:.1f} max EV")
-        if row.get("pitcher_hr9"):
-            stats.append(f"opp SP {row['pitcher_hr9']} HR/9")
-
-        stat_text = f"\n  {' | '.join(stats)}" if stats else ""
-
-        display = f"[{player}]({link})" if link else player
-        team = f" ({row['team_abbr']})" if row.get("team_abbr") else ""
-
-        lines.append(f"• {display}{team} **{odds_text}** at {book}{stat_text}")
-
-    combined = combined_american_odds([row["price"] for row in rows])
-    if combined is not None and len(rows) > 1:
-        lines.append(f"\nApprox. combined odds: **{format_american_odds(combined)}**")
-
-    return "\n".join(lines)
-
-
-async def send_morning_hr_parlays_embed(channel, hot_streaks, two_hr_watch, today_games):
-    if not ENABLE_MORNING_HR_PARLAYS:
-        return
-
-    if not ODDS_API_KEY:
-        await channel.send("💣 **Best HR Parlays Today**\nODDS_API_KEY is not set, so sportsbook-linked parlays are unavailable.")
-        return
-
-    try:
-        odds_rows = await asyncio.to_thread(build_today_hr_odds_rows, today_games, False)
-        parlays = await asyncio.to_thread(build_best_morning_hr_parlays, hot_streaks, two_hr_watch, odds_rows)
-
-    except Exception as exc:
-        log.warning("Could not build morning HR parlays: %s", exc)
-        await channel.send(f"💣 **Best HR Parlays Today**\nCould not load HR odds right now.\n`{type(exc).__name__}: {exc}`")
-        return
-
-    if not any(parlays.values()):
-        await channel.send(f"💣 **Best HR Parlays Today**\nNo sportsbook HR lines available yet.\n{cache_status_text()}")
-        return
-
-    embed = discord.Embed(
-        title="💣 Best HR Parlays Today",
-        description="Max 4 legs per tier. Picks use MLB form/contact data first, then best available sportsbook HR odds.",
-        color=discord.Color.blue(),
-    )
-
-    embed.add_field(name=f"🟢 Safe — {len(parlays['safe'])} Legs", value=morning_parlay_tier_text(parlays["safe"]), inline=False)
-    embed.add_field(name=f"🟡 Risky — {len(parlays['risky'])} Legs", value=morning_parlay_tier_text(parlays["risky"]), inline=False)
-    embed.add_field(name=f"🔴 Bomb — {len(parlays['bomb'])} Legs", value=morning_parlay_tier_text(parlays["bomb"]), inline=False)
-    embed.set_footer(text="Odds from The Odds API. Links depend on sportsbook availability. Bet responsibly.")
-
-    await channel.send(embed=embed)
 
 
 
@@ -1835,6 +1385,7 @@ async def on_ready():
 
     log.info("Bot ready as %s", client.user)
     log.info("Schedule set for %s:%02d %s", DAILY_RECAP_HOUR, DAILY_RECAP_MINUTE, TIMEZONE)
+    log.info("Daily recap catch-up hours: %s", DAILY_RECAP_CATCHUP_HOURS)
     log.info("Redeploy protection: skip_old_plays=%s max_minutes=%s", SKIP_OLD_PLAYS_ON_STARTUP, OLD_PLAY_MAX_MINUTES)
 
     # discord.py may fire on_ready more than once after reconnects.
@@ -1928,6 +1479,18 @@ async def on_message(message):
             await message.channel.send("Could not load birthday data right now.")
             return
         await send_birthday_embed(message.channel, birthday_narratives)
+    elif content == "!schedulestatus":
+        now = datetime.now(TZ)
+        target_date = yesterday_str()
+        await message.channel.send(
+            "Schedule status\n"
+            f"Now: `{now.strftime('%Y-%m-%d %I:%M %p %Z')}`\n"
+            f"Daily report time: `{DAILY_RECAP_HOUR}:{DAILY_RECAP_MINUTE:02d} {TIMEZONE}`\n"
+            f"Target recap date: `{target_date}`\n"
+            f"Last posted date: `{state.get('last_daily_recap_date')}`\n"
+            f"Catch-up hours: `{DAILY_RECAP_CATCHUP_HOURS}`"
+        )
+
     elif content == "!ktest":
         await message.channel.send(
             f"Strikeout alerts: enabled={ENABLE_STRIKEOUT_ALERTS}, "
