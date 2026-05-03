@@ -16,6 +16,8 @@ DISCORD_STRIKEOUT_CHANNEL_ID = int(os.getenv("DISCORD_STRIKEOUT_CHANNEL_ID", "0"
 ENABLE_STRIKEOUT_ALERTS = os.getenv("ENABLE_STRIKEOUT_ALERTS", "false").lower() == "true"
 STRIKEOUT_ALERT_MIN_KS = int(os.getenv("STRIKEOUT_ALERT_MIN_KS", "3"))
 STRIKEOUT_ALERT_MAX_INNING = int(os.getenv("STRIKEOUT_ALERT_MAX_INNING", "2"))
+STRIKEOUT_EXTENDED_MIN_KS = int(os.getenv("STRIKEOUT_EXTENDED_MIN_KS", "5"))
+STRIKEOUT_EXTENDED_MAX_INNING = int(os.getenv("STRIKEOUT_EXTENDED_MAX_INNING", "4"))
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "15"))
 TIMEZONE = os.getenv("TIMEZONE", "America/Chicago")
 REPORT_BUILD_TIMEOUT_SECONDS = int(os.getenv("REPORT_BUILD_TIMEOUT_SECONDS", "120"))
@@ -540,6 +542,7 @@ async def maybe_send_no_hr_3rd_alert(channel, game, plays):
 
 
 
+
 # =========================
 # STRIKEOUT ALERTS
 # =========================
@@ -579,10 +582,33 @@ def get_current_game_inning_from_feed(feed_data):
         return None
 
 
-def collect_early_strikeout_pitchers(game, feed_data):
+def get_k_alert_signal(ks, pitch_count, on_pace, tier):
+    """
+    Simple signal label based on pitch efficiency and K pace.
+    """
+    if tier == "early":
+        if pitch_count <= 35:
+            return "🔥 Efficient K pace", "🔥 Early K Alert — Strong Pace", discord.Color.orange()
+        if pitch_count >= 45:
+            return "⚠️ Good K pace, but pitch count is getting high", "⚠️ Early K Alert — High Pitch Count", discord.Color.gold()
+        return "✅ Good early K rhythm", "✅ Early K Alert — Solid Start", discord.Color.green()
+
+    if pitch_count <= 65:
+        return "🔥 Sustained dominance", "🔥 K Alert — Strong Pace", discord.Color.orange()
+    if pitch_count >= 80:
+        return "⚠️ Pace is good, but pitch count is climbing", "⚠️ K Alert — Watch Pitch Count", discord.Color.gold()
+    return "✅ Strong K pace", "✅ K Alert — Solid Start", discord.Color.green()
+
+
+def collect_strikeout_alert_pitchers(game, feed_data):
+    """
+    Two-tier K alerts:
+    - Early: 3+ Ks by inning 2
+    - Extended: 5+ Ks by inning 4
+    """
     current_inning = get_current_game_inning_from_feed(feed_data)
 
-    if current_inning is None or current_inning > STRIKEOUT_ALERT_MAX_INNING:
+    if current_inning is None:
         return []
 
     boxscore = ((feed_data.get("liveData") or {}).get("boxscore") or {})
@@ -604,27 +630,47 @@ def collect_early_strikeout_pitchers(game, feed_data):
 
             ks = int(pitching.get("strikeOuts", 0) or 0)
             pitch_count = int(pitching.get("pitchesThrown", 0) or 0)
-
-            if ks < STRIKEOUT_ALERT_MIN_KS:
-                continue
-
             innings_pitched_raw = pitching.get("inningsPitched", "0")
             innings_pitched = innings_pitched_to_float(innings_pitched_raw)
 
-            if innings_pitched > STRIKEOUT_ALERT_MAX_INNING + 0.99:
+            tiers = []
+
+            if current_inning <= STRIKEOUT_ALERT_MAX_INNING and ks >= STRIKEOUT_ALERT_MIN_KS:
+                tiers.append({
+                    "tier": "early",
+                    "min_ks": STRIKEOUT_ALERT_MIN_KS,
+                    "max_inning": STRIKEOUT_ALERT_MAX_INNING,
+                })
+
+            if current_inning <= STRIKEOUT_EXTENDED_MAX_INNING and ks >= STRIKEOUT_EXTENDED_MIN_KS:
+                tiers.append({
+                    "tier": "extended",
+                    "min_ks": STRIKEOUT_EXTENDED_MIN_KS,
+                    "max_inning": STRIKEOUT_EXTENDED_MAX_INNING,
+                })
+
+            if not tiers:
                 continue
 
-            found.append({
-                "player_id": person.get("id"),
-                "name": person.get("fullName", "Unknown Pitcher"),
-                "team_abbr": team_abbr,
-                "ks": ks,
-                "innings_pitched": innings_pitched_raw,
-                "pitch_count": pitch_count,
-                "current_inning": current_inning,
-                "game": game_label(game),
-                "game_pk": game.get("gamePk"),
-            })
+            if innings_pitched <= 0:
+                on_pace = 0
+            else:
+                on_pace = round((ks / innings_pitched) * 9, 1)
+
+            for tier_info in tiers:
+                found.append({
+                    "player_id": person.get("id"),
+                    "name": person.get("fullName", "Unknown Pitcher"),
+                    "team_abbr": team_abbr,
+                    "ks": ks,
+                    "innings_pitched": innings_pitched_raw,
+                    "pitch_count": pitch_count,
+                    "on_pace": on_pace,
+                    "current_inning": current_inning,
+                    "game": game_label(game),
+                    "game_pk": game.get("gamePk"),
+                    **tier_info,
+                })
 
     return found
 
@@ -642,10 +688,10 @@ async def maybe_send_strikeout_alerts(channel, game, feed_data):
             log.warning("Could not fetch strikeout channel %s: %s", DISCORD_STRIKEOUT_CHANNEL_ID, exc)
             target_channel = channel
 
-    pitchers = collect_early_strikeout_pitchers(game, feed_data)
+    pitchers = collect_strikeout_alert_pitchers(game, feed_data)
 
     for pitcher in pitchers:
-        alert_key = f"{pitcher['game_pk']}-{pitcher.get('player_id')}-{STRIKEOUT_ALERT_MIN_KS}ks"
+        alert_key = f"{pitcher['game_pk']}-{pitcher.get('player_id')}-{pitcher['tier']}-{pitcher['min_ks']}ks"
 
         if alert_key in state["seen_strikeout_alerts"]:
             continue
@@ -653,18 +699,33 @@ async def maybe_send_strikeout_alerts(channel, game, feed_data):
         state["seen_strikeout_alerts"].append(alert_key)
         save_state()
 
+        signal, title, color = get_k_alert_signal(
+            pitcher["ks"],
+            pitcher["pitch_count"],
+            pitcher["on_pace"],
+            pitcher["tier"],
+        )
+
         embed = discord.Embed(
-            title="🔥 Early K Alert",
+            title=title,
             description=(
                 f"**{pitcher['name']} ({pitcher['team_abbr']})**\n"
                 f"{pitcher['ks']} Ks through {pitcher['innings_pitched']} IP\n"
-                f"Pitch Count: {pitcher.get('pitch_count', 'N/A')}\n\n"
+                f"Pitch Count: {pitcher['pitch_count']}\n"
+                f"On Pace: {pitcher['on_pace']} Ks\n\n"
+                f"Signal: {signal}\n"
                 f"**Game:** {pitcher['game']}"
             ),
-            color=discord.Color.orange(),
+            color=color,
             url=f"https://www.mlb.com/gameday/{pitcher['game_pk']}",
         )
-        embed.set_footer(text=f"Trigger: {STRIKEOUT_ALERT_MIN_KS}+ Ks in innings 1-{STRIKEOUT_ALERT_MAX_INNING}")
+
+        if pitcher["tier"] == "early":
+            footer = f"Trigger: {STRIKEOUT_ALERT_MIN_KS}+ Ks in innings 1-{STRIKEOUT_ALERT_MAX_INNING}"
+        else:
+            footer = f"Trigger: {STRIKEOUT_EXTENDED_MIN_KS}+ Ks by inning {STRIKEOUT_EXTENDED_MAX_INNING}"
+
+        embed.set_footer(text=footer)
 
         await target_channel.send(embed=embed)
 
@@ -1498,7 +1559,7 @@ async def on_message(message):
         await message.channel.send(
             f"Strikeout alerts: enabled={ENABLE_STRIKEOUT_ALERTS}, "
             f"channel_id={DISCORD_STRIKEOUT_CHANNEL_ID or 'main'}, "
-            f"trigger={STRIKEOUT_ALERT_MIN_KS}+ Ks by inning {STRIKEOUT_ALERT_MAX_INNING}"
+            f"early={STRIKEOUT_ALERT_MIN_KS}+ Ks by inning {STRIKEOUT_ALERT_MAX_INNING}, extended={STRIKEOUT_EXTENDED_MIN_KS}+ Ks by inning {STRIKEOUT_EXTENDED_MAX_INNING}"
         )
 
     elif content == "!ping":
