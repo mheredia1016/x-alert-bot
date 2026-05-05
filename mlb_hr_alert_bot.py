@@ -65,7 +65,7 @@ NEAR_HR_MAX_ANGLE = float(os.getenv("NEAR_HR_MAX_ANGLE", "38"))
 NEAR_HR_MIN_DISTANCE = float(os.getenv("NEAR_HR_MIN_DISTANCE", "375"))
 NEAR_HR_CONFIRM_DELAY = float(os.getenv("NEAR_HR_CONFIRM_DELAY", "4"))
 
-STATE_FILE = Path("mlb_hr_alert_state.json")
+STATE_FILE = Path(os.getenv("STATE_FILE", "/data/mlb_hr_alert_state.json"))
 SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date}"
 LIVE_FEED_URL = "https://statsapi.mlb.com/api/v1.1/game/{gamePk}/feed/live"
 BOXSCORE_URL = "https://statsapi.mlb.com/api/v1/game/{gamePk}/boxscore"
@@ -157,6 +157,7 @@ def save_state():
             state[extra_key] = state[extra_key][-500:]
     state["seen_no_hr_3rd_game_ids"] = state["seen_no_hr_3rd_game_ids"][-500:]
     state["seen_more_hr_odds_keys"] = state["seen_more_hr_odds_keys"][-500:]
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
@@ -334,6 +335,29 @@ def make_stable_play_key(game_pk, play):
         str(about.get("halfInning", "")),
         str(result.get("eventType", "")),
     ])
+
+
+def play_is_recent(play):
+    """
+    Prevents redeploy/startup from reposting old HRs if Railway state was wiped.
+    Allows only plays from the last OLD_PLAY_MAX_MINUTES minutes.
+    """
+    if not SKIP_OLD_PLAYS_ON_STARTUP:
+        return True
+
+    about = play.get("about", {}) or {}
+    raw_time = about.get("endTime") or about.get("startTime")
+
+    if not raw_time:
+        return True
+
+    try:
+        play_time = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+        now = datetime.now(play_time.tzinfo)
+        age_minutes = (now - play_time).total_seconds() / 60
+        return age_minutes <= OLD_PLAY_MAX_MINUTES
+    except Exception:
+        return True
 
 
 
@@ -1249,6 +1273,18 @@ def split_lines_into_chunks(header: str, lines: list[str], limit: int = 1900):
 
 
 
+
+# =========================
+# ODDS CACHE / MORNING PARLAY HELPERS
+# =========================
+
+def cache_status_text():
+    return "Odds cache disabled / not loaded. Stat-only parlays do not need Odds API."
+
+
+def build_today_hr_odds_rows(today_games, force_refresh=False):
+    return []
+
 # =========================
 # SAFE FALLBACK EMBEDS / OPTIONAL FEATURES
 # =========================
@@ -1287,6 +1323,172 @@ async def send_more_hr_odds_after_delay(*args, **kwargs):
     or if the full Odds API follow-up module is not present.
     """
     return
+
+
+
+
+# =========================
+# DATA-DRIVEN STAT-ONLY HR PARLAYS
+# =========================
+
+def _parlay_candidate_score(row):
+    score = 0
+    score += int(row.get("last_7_hr", 0) or 0) * 14
+    score += int(row.get("streak_days", 0) or 0) * 7
+    score += int(row.get("near_hr_count", 0) or 0) * 8
+
+    if row.get("last_hr_ev"):
+        score += max(0, float(row["last_hr_ev"]) - 95) * 0.8
+    elif row.get("max_ev"):
+        score += max(0, float(row["max_ev"]) - 98) * 0.5
+
+    if row.get("pitcher_hr9"):
+        score += float(row["pitcher_hr9"]) * 10
+
+    if row.get("score"):
+        score += float(row["score"]) * 0.35
+
+    return round(score, 1)
+
+
+def build_stat_only_hr_parlay_picks(hot_streaks, two_hr_watch):
+    """
+    Builds Safe/Risky/Bomb from MLB-only signals.
+    No Odds API needed, so no 429s.
+
+    Signals:
+    - recent HRs
+    - HR streak days
+    - near-HR balls
+    - EV
+    - opposing pitcher HR/9 when available
+    """
+    merged = {}
+
+    for row in hot_streaks or []:
+        key = row.get("player_id") or row.get("name")
+        merged[key] = {
+            "name": row.get("name", "Unknown"),
+            "team_abbr": row.get("team_abbr", "MLB"),
+            "last_7_hr": int(row.get("total_hr", 0) or 0),
+            "streak_days": int(row.get("streak_days", 0) or 0),
+            "near_hr_count": 0,
+            "max_ev": None,
+            "last_hr_ev": None,
+            "pitcher_name": "TBD",
+            "pitcher_hr9": None,
+            "base_score": 0,
+        }
+
+    for row in two_hr_watch or []:
+        key = row.get("name")
+        existing = merged.setdefault(key, {
+            "name": row.get("name", "Unknown"),
+            "team_abbr": row.get("team_abbr", "MLB"),
+            "last_7_hr": int(row.get("last_7_hr", 0) or 0),
+            "streak_days": int(row.get("streak_days", 0) or 0),
+            "near_hr_count": 0,
+            "max_ev": None,
+            "last_hr_ev": None,
+            "pitcher_name": "TBD",
+            "pitcher_hr9": None,
+            "base_score": 0,
+        })
+
+        existing["team_abbr"] = row.get("team_abbr") or existing.get("team_abbr", "MLB")
+        existing["last_7_hr"] = max(existing.get("last_7_hr", 0), int(row.get("last_7_hr", 0) or 0))
+        existing["near_hr_count"] = max(existing.get("near_hr_count", 0), int(row.get("near_hr_count", 0) or 0))
+        existing["max_ev"] = row.get("max_ev") or existing.get("max_ev")
+        existing["last_hr_ev"] = row.get("last_hr_ev") or existing.get("last_hr_ev")
+        existing["pitcher_name"] = row.get("pitcher_name") or existing.get("pitcher_name", "TBD")
+        existing["pitcher_hr9"] = row.get("pitcher_hr9") if row.get("pitcher_hr9") is not None else existing.get("pitcher_hr9")
+        existing["score"] = max(float(existing.get("score", 0) or 0), float(row.get("score", 0) or 0))
+
+    candidates = list(merged.values())
+    for c in candidates:
+        c["final_score"] = _parlay_candidate_score(c)
+
+    candidates = [c for c in candidates if c["last_7_hr"] > 0 or c["near_hr_count"] > 0 or c["final_score"] >= 25]
+    candidates.sort(key=lambda x: (-x["final_score"], -x["last_7_hr"], -x["near_hr_count"], x["name"]))
+
+    used_players = set()
+
+    def pick(pool, max_legs):
+        picks = []
+        used_teams = set()
+        for c in pool:
+            pkey = c["name"].lower()
+            team = c.get("team_abbr", "MLB")
+            if pkey in used_players:
+                continue
+            if team in used_teams:
+                continue
+            picks.append(c)
+            used_players.add(pkey)
+            used_teams.add(team)
+            if len(picks) >= max_legs:
+                break
+        return picks
+
+    safe_pool = [c for c in candidates if c["final_score"] >= 45]
+    risky_pool = [c for c in candidates if c["final_score"] >= 30]
+    bomb_pool = candidates[:]
+
+    safe = pick(safe_pool or candidates, max(2, min(4, MORNING_PARLAY_LEGS_SAFE)))
+    risky = pick(risky_pool or candidates, max(2, min(4, MORNING_PARLAY_LEGS_RISKY)))
+    bomb = pick(bomb_pool, max(2, min(4, MORNING_PARLAY_LEGS_BOMB)))
+
+    return {"safe": safe, "risky": risky, "bomb": bomb}
+
+
+def _format_stat_parlay_rows(rows):
+    if not rows:
+        return "Not enough strong candidates today."
+
+    lines = []
+    for row in rows:
+        details = []
+        if row.get("last_7_hr"):
+            details.append(f"{row['last_7_hr']} HR last {HOT_STREAK_DAYS}d")
+        if row.get("streak_days"):
+            details.append(f"{row['streak_days']}d streak")
+        if row.get("near_hr_count"):
+            details.append(f"{row['near_hr_count']} near-HR last 3g")
+        if row.get("last_hr_ev"):
+            details.append(f"{float(row['last_hr_ev']):.1f} EV last HR")
+        elif row.get("max_ev"):
+            details.append(f"{float(row['max_ev']):.1f} max EV")
+        if row.get("pitcher_hr9") is not None:
+            details.append(f"opp SP {row['pitcher_hr9']} HR/9")
+
+        detail_text = " | ".join(details) if details else "MLB signal score"
+        lines.append(f"• **{row['name']} ({row.get('team_abbr', 'MLB')})** — Score {row['final_score']}\n  {detail_text}")
+
+    return "\n".join(lines)
+
+
+async def send_morning_hr_parlays_embed(channel, hot_streaks, two_hr_watch, today_games):
+    if not ENABLE_MORNING_HR_PARLAYS:
+        return
+
+    parlays = build_stat_only_hr_parlay_picks(hot_streaks, two_hr_watch)
+
+    if not any(parlays.values()):
+        await channel.send("💣 **Best HR Parlays Today**\nNo strong MLB stat-based HR parlay candidates found today.")
+        return
+
+    embed = discord.Embed(
+        title="💣 Best HR Parlays Today",
+        description="Stat-only picks using MLB form, EV, near-HR contact, and pitcher matchup. No Odds API needed.",
+        color=discord.Color.blue(),
+    )
+
+    embed.add_field(name=f"🟢 Safe — {len(parlays['safe'])} Legs", value=_format_stat_parlay_rows(parlays["safe"]), inline=False)
+    embed.add_field(name=f"🟡 Risky — {len(parlays['risky'])} Legs", value=_format_stat_parlay_rows(parlays["risky"]), inline=False)
+    embed.add_field(name=f"🔴 Bomb — {len(parlays['bomb'])} Legs", value=_format_stat_parlay_rows(parlays["bomb"]), inline=False)
+    embed.set_footer(text="Stat model only. Add legs manually in your sportsbook. Bet responsibly.")
+
+    await channel.send(embed=embed)
 
 
 
@@ -1479,6 +1681,7 @@ async def on_message(message):
     if content == "!yhr":
         await message.channel.send("Building yesterday's HR recap... this may take a moment while MLB data loads.")
         await post_daily_hr_recap(force=True)
+        return
     elif content == "!2hr":
         await message.channel.send("Building 2-HR Watch... checking recent HR hitters only.")
         try:
@@ -1501,24 +1704,22 @@ async def on_message(message):
             return
 
         await send_2hr_watch_embed(message.channel, two_hr_watch)
+        return
 
     elif content == "!oddsdebug":
         await message.channel.send(
             f"Odds debug: key_set={bool(ODDS_API_KEY)}, get_odds_json_exists={'get_odds_json' in globals()}, books={ODDS_BOOKMAKERS}"
         )
+        return
 
     elif content == "!oddscache":
         await message.channel.send(cache_status_text())
+        return
 
     elif content == "!refreshhrparlays":
-        await message.channel.send("Refreshing HR odds cache once...")
-        try:
-            today_games = await asyncio.to_thread(get_today_games)
-            odds_rows = await asyncio.to_thread(build_today_hr_odds_rows, today_games, True)
-            await message.channel.send(f"Refreshed HR odds cache: {len(odds_rows)} player lines.")
-        except Exception as exc:
-            log.exception("Refresh HR parlays failed: %s", exc)
-            await message.channel.send(f"Could not refresh HR odds cache: `{type(exc).__name__}: {exc}`")
+        await message.channel.send("HR parlays are running in stat-only mode now — no Odds API refresh needed.")
+        return
+
 
     elif content == "!hrparlays":
         await message.channel.send("Building today’s best HR parlays... using cached odds when available.")
@@ -1531,6 +1732,7 @@ async def on_message(message):
         except Exception as exc:
             log.exception("Morning HR parlays command failed: %s", exc)
             await message.channel.send("Could not build HR parlays right now.")
+        return
 
     elif content == "!bday":
         await message.channel.send("Checking today's birthday narrative...")
@@ -1543,6 +1745,7 @@ async def on_message(message):
             await message.channel.send("Could not load birthday data right now.")
             return
         await send_birthday_embed(message.channel, birthday_narratives)
+        return
     elif content == "!schedulestatus":
         now = datetime.now(TZ)
         target_date = yesterday_str()
@@ -1554,6 +1757,7 @@ async def on_message(message):
             f"Last posted date: `{state.get('last_daily_recap_date')}`\n"
             f"Catch-up hours: `{DAILY_RECAP_CATCHUP_HOURS}`"
         )
+        return
 
     elif content == "!ktest":
         await message.channel.send(
@@ -1561,9 +1765,11 @@ async def on_message(message):
             f"channel_id={DISCORD_STRIKEOUT_CHANNEL_ID or 'main'}, "
             f"early={STRIKEOUT_ALERT_MIN_KS}+ Ks by inning {STRIKEOUT_ALERT_MAX_INNING}, extended={STRIKEOUT_EXTENDED_MIN_KS}+ Ks by inning {STRIKEOUT_EXTENDED_MAX_INNING}"
         )
+        return
 
     elif content == "!ping":
         await message.channel.send("pong")
+        return
 
 
 def main():
