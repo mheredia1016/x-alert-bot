@@ -57,6 +57,11 @@ MORNING_PARLAY_LEGS_SAFE = int(os.getenv("MORNING_PARLAY_LEGS_SAFE", "2"))
 MORNING_PARLAY_LEGS_RISKY = int(os.getenv("MORNING_PARLAY_LEGS_RISKY", "3"))
 MORNING_PARLAY_LEGS_BOMB = int(os.getenv("MORNING_PARLAY_LEGS_BOMB", "4"))
 
+# HR parlay scoring weights
+HR_PARLAY_EV_WEIGHT = float(os.getenv("HR_PARLAY_EV_WEIGHT", "1.35"))
+HR_PARLAY_NEAR_HR_WEIGHT = float(os.getenv("HR_PARLAY_NEAR_HR_WEIGHT", "10"))
+HR_PARLAY_BALLPARK_WEIGHT = float(os.getenv("HR_PARLAY_BALLPARK_WEIGHT", "1.0"))
+
 
 
 NEAR_HR_MIN_EV = float(os.getenv("NEAR_HR_MIN_EV", "102"))
@@ -81,6 +86,7 @@ processing_play_ids = set()
 processing_near_play_ids = set()
 morning_hr_odds_cache = {"fetched_at": None, "rows": []}
 daily_recap_running = False
+processed_message_ids = set()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("mlb_hr_alert_bot")
@@ -89,6 +95,9 @@ intents = discord.Intents.default()
 intents.messages = True
 intents.message_content = True
 client = discord.Client(intents=intents)
+
+discord_send_lock = None
+DISCORD_SEND_DELAY_SECONDS = float(os.getenv("DISCORD_SEND_DELAY_SECONDS", "1.35"))
 
 state = {
     "seen_hr_play_ids": [],
@@ -361,6 +370,32 @@ def play_is_recent(play):
 
 
 
+
+# =========================
+# DISCORD SEND RATE LIMIT PROTECTION
+# =========================
+
+async def safe_discord_send(channel, *args, **kwargs):
+    """
+    Serializes outgoing Discord messages and spaces them out.
+    This prevents Discord 429 global rate-limit blocks when reports/alerts burst-send.
+    """
+    global discord_send_lock
+
+    if discord_send_lock is None:
+        discord_send_lock = asyncio.Lock()
+
+    async with discord_send_lock:
+        try:
+            msg = await channel.send(*args, **kwargs)
+            await asyncio.sleep(DISCORD_SEND_DELAY_SECONDS)
+            return msg
+        except discord.HTTPException as exc:
+            log.warning("Discord send failed/rate-limited: %s", exc)
+            await asyncio.sleep(max(DISCORD_SEND_DELAY_SECONDS * 2, 3))
+            return None
+
+
 async def send_startup_message():
     if DISABLE_STARTUP_MESSAGE:
         return
@@ -369,7 +404,7 @@ async def send_startup_message():
     msg_date = today_str()
     if state.get("last_startup_date") == msg_date:
         return
-    await channel.send("✅ MLB HR/Near-HR bot is online.")
+    await safe_discord_send(channel, "✅ MLB HR/Near-HR bot is online.")
     state["last_startup_date"] = msg_date
     save_state()
 
@@ -424,7 +459,7 @@ async def send_alert(channel, game, play, alert_type, all_plays=None):
     if headshot_url:
         embed.set_image(url=headshot_url)
     embed.set_footer(text="MLB live feed")
-    await channel.send(embed=embed)
+    await safe_discord_send(channel, embed=embed)
 
     if (
         alert_type == "hr"
@@ -559,7 +594,7 @@ async def maybe_send_no_hr_3rd_alert(channel, game, plays):
     )
     embed.set_footer(text="HR bettors support group checking in")
 
-    await channel.send(embed=embed)
+    await safe_discord_send(channel, embed=embed)
 
     state["seen_no_hr_3rd_game_ids"].append(game_key)
     save_state()
@@ -751,7 +786,7 @@ async def maybe_send_strikeout_alerts(channel, game, feed_data):
 
         embed.set_footer(text=footer)
 
-        await target_channel.send(embed=embed)
+        await safe_discord_send(target_channel, embed=embed)
 
 
 async def process_game(channel, game):
@@ -1185,9 +1220,11 @@ def build_2hr_watch(today_games, hot_streaks, top_n: int = TWO_HR_WATCH_TOP_N):
             confidence = "Low"
 
         candidates.append({
+            "player_id": player_id,
             "name": player_name,
             "team_abbr": team_abbr,
             "game": game_label(game) if game else "Game match TBD",
+            "ballpark_boost": get_ballpark_boost_from_game_label(game_label(game)) if game else 0,
             "last_7_hr": last_7_hr,
             "streak_days": streak_days,
             "near_hr_count": near_hr_count,
@@ -1207,7 +1244,7 @@ async def send_2hr_watch_embed(channel, two_hr_watch):
     if not ENABLE_2HR_WATCH:
         return
     if not two_hr_watch:
-        await channel.send("💥 **2-HR Watch**\nNo recent HR hitters found for today’s slate.")
+        await safe_discord_send(channel, "💥 **2-HR Watch**\nNo recent HR hitters found for today’s slate.")
         return
     embed = discord.Embed(title="💥 2-HR Watch", color=discord.Color.red(), description="MLB-only model: recent HR form, near-HR contact, EV, and opposing probable pitcher HR/9")
     for idx, row in enumerate(two_hr_watch, start=1):
@@ -1227,14 +1264,14 @@ async def send_2hr_watch_embed(channel, two_hr_watch):
             lines.append(f"• Confidence: {row['confidence']}")
         embed.add_field(name=f"{idx}. {row['name']} ({row['team_abbr']})", value="\n".join(lines), inline=False)
     embed.set_footer(text="Not betting advice. Score is a simple signal model from MLB Stats API data.")
-    await channel.send(embed=embed)
+    await safe_discord_send(channel, embed=embed)
 
 
 async def send_birthday_embed(channel, birthday_narratives):
     if not ENABLE_BIRTHDAY_NARRATIVE:
         return
     if not birthday_narratives:
-        await channel.send("🎂 **Birthday Narrative Watch**\nNo active roster birthday matches found for teams playing today.")
+        await safe_discord_send(channel, "🎂 **Birthday Narrative Watch**\nNo active roster birthday matches found for teams playing today.")
         return
     embed = discord.Embed(title="🎂 Birthday Narrative Watch", color=discord.Color.magenta(), description="Active roster players with birthdays today whose team plays today")
     for player in birthday_narratives[:10]:
@@ -1249,7 +1286,7 @@ async def send_birthday_embed(channel, birthday_narratives):
     if headshot:
         embed.set_thumbnail(url=headshot)
     embed.set_footer(text="Birthday note means active roster + team has a game today; lineup not guaranteed.")
-    await channel.send(embed=embed)
+    await safe_discord_send(channel, embed=embed)
 
 
 
@@ -1314,7 +1351,7 @@ async def send_hot_streaks_embed(channel, hot_streaks):
             inline=False,
         )
 
-    await channel.send(embed=embed)
+    await safe_discord_send(channel, embed=embed)
 
 
 async def send_more_hr_odds_after_delay(*args, **kwargs):
@@ -1327,29 +1364,109 @@ async def send_more_hr_odds_after_delay(*args, **kwargs):
 
 
 
+
+# =========================
+# ADVANCED HR PARLAY SIGNALS
+# =========================
+
+BALLPARK_HR_BOOST = {
+    "Colorado Rockies": 12,
+    "Cincinnati Reds": 8,
+    "New York Yankees": 7,
+    "Philadelphia Phillies": 5,
+    "Boston Red Sox": 4,
+    "Chicago White Sox": 4,
+    "Baltimore Orioles": 3,
+    "Houston Astros": 3,
+    "Arizona Diamondbacks": 2,
+    "Texas Rangers": 2,
+    "Los Angeles Dodgers": 1,
+    "Atlanta Braves": 1,
+
+    "San Francisco Giants": -6,
+    "Seattle Mariners": -4,
+    "Detroit Tigers": -3,
+    "New York Mets": -3,
+    "Miami Marlins": -2,
+    "San Diego Padres": -2,
+    "Tampa Bay Rays": -2,
+}
+
+
+def get_ballpark_boost_from_game_label(game_label_text):
+    text = (game_label_text or "").lower()
+
+    for team_name, boost in BALLPARK_HR_BOOST.items():
+        if team_name.lower() in text:
+            return boost
+
+    return 0
+
+
+def barrel_proxy_score(max_ev, last_hr_ev, near_hr_count):
+    """
+    Lightweight barrel-rate proxy using existing MLB live-feed data.
+    True barrel rate requires Baseball Savant/Statcast data, so this avoids new API risk.
+    """
+    score = 0
+    ev_source = last_hr_ev if last_hr_ev else max_ev
+
+    if ev_source:
+        ev = float(ev_source)
+
+        if ev >= 112:
+            score += 10
+        elif ev >= 108:
+            score += 7
+        elif ev >= 104:
+            score += 4
+        elif ev >= 100:
+            score += 2
+
+    score += min(int(near_hr_count or 0), 4) * 2
+    return score
+
+
+
 # =========================
 # DATA-DRIVEN STAT-ONLY HR PARLAYS
 # =========================
 
 def _parlay_candidate_score(row):
     score = 0
+
+    # Recent HR production
     score += int(row.get("last_7_hr", 0) or 0) * 14
     score += int(row.get("streak_days", 0) or 0) * 7
-    score += int(row.get("near_hr_count", 0) or 0) * 8
 
-    if row.get("last_hr_ev"):
-        score += max(0, float(row["last_hr_ev"]) - 95) * 0.8
-    elif row.get("max_ev"):
-        score += max(0, float(row["max_ev"]) - 98) * 0.5
+    # Near-HR contact quality
+    near_hr_count = int(row.get("near_hr_count", 0) or 0)
+    score += near_hr_count * HR_PARLAY_NEAR_HR_WEIGHT
 
+    max_ev = row.get("max_ev")
+    last_hr_ev = row.get("last_hr_ev")
+
+    # Heavier EV weighting
+    if last_hr_ev:
+        score += max(0, float(last_hr_ev) - 95) * HR_PARLAY_EV_WEIGHT
+    elif max_ev:
+        score += max(0, float(max_ev) - 98) * (HR_PARLAY_EV_WEIGHT * 0.75)
+
+    # Barrel-rate proxy from EV + near-HR
+    score += barrel_proxy_score(max_ev, last_hr_ev, near_hr_count)
+
+    # Pitcher HR weakness
     if row.get("pitcher_hr9"):
         score += float(row["pitcher_hr9"]) * 10
 
+    # Ballpark HR factor
+    score += float(row.get("ballpark_boost", 0) or 0) * HR_PARLAY_BALLPARK_WEIGHT
+
+    # Existing 2HR model score
     if row.get("score"):
         score += float(row["score"]) * 0.35
 
     return round(score, 1)
-
 
 def build_stat_only_hr_parlay_picks(hot_streaks, two_hr_watch):
     """
@@ -1377,6 +1494,8 @@ def build_stat_only_hr_parlay_picks(hot_streaks, two_hr_watch):
             "last_hr_ev": None,
             "pitcher_name": "TBD",
             "pitcher_hr9": None,
+            "ballpark_boost": 0,
+            "barrel_proxy": 0,
             "base_score": 0,
         }
 
@@ -1392,6 +1511,8 @@ def build_stat_only_hr_parlay_picks(hot_streaks, two_hr_watch):
             "last_hr_ev": None,
             "pitcher_name": "TBD",
             "pitcher_hr9": None,
+            "ballpark_boost": 0,
+            "barrel_proxy": 0,
             "base_score": 0,
         })
 
@@ -1402,10 +1523,16 @@ def build_stat_only_hr_parlay_picks(hot_streaks, two_hr_watch):
         existing["last_hr_ev"] = row.get("last_hr_ev") or existing.get("last_hr_ev")
         existing["pitcher_name"] = row.get("pitcher_name") or existing.get("pitcher_name", "TBD")
         existing["pitcher_hr9"] = row.get("pitcher_hr9") if row.get("pitcher_hr9") is not None else existing.get("pitcher_hr9")
+        existing["game"] = row.get("game") or existing.get("game", "Game match TBD")
+        existing["ballpark_boost"] = row.get("ballpark_boost", existing.get("ballpark_boost", 0))
         existing["score"] = max(float(existing.get("score", 0) or 0), float(row.get("score", 0) or 0))
 
     candidates = list(merged.values())
+
     for c in candidates:
+        if not c.get("ballpark_boost"):
+            c["ballpark_boost"] = get_ballpark_boost_from_game_label(c.get("game"))
+        c["barrel_proxy"] = barrel_proxy_score(c.get("max_ev"), c.get("last_hr_ev"), c.get("near_hr_count"))
         c["final_score"] = _parlay_candidate_score(c)
 
     candidates = [c for c in candidates if c["last_7_hr"] > 0 or c["near_hr_count"] > 0 or c["final_score"] >= 25]
@@ -1460,6 +1587,11 @@ def _format_stat_parlay_rows(rows):
             details.append(f"{float(row['max_ev']):.1f} max EV")
         if row.get("pitcher_hr9") is not None:
             details.append(f"opp SP {row['pitcher_hr9']} HR/9")
+        if row.get("ballpark_boost"):
+            boost = row["ballpark_boost"]
+            details.append(f"park {'+' if boost > 0 else ''}{boost}")
+        if row.get("barrel_proxy"):
+            details.append(f"barrel proxy +{row['barrel_proxy']}")
 
         detail_text = " | ".join(details) if details else "MLB signal score"
         lines.append(f"• **{row['name']} ({row.get('team_abbr', 'MLB')})** — Score {row['final_score']}\n  {detail_text}")
@@ -1474,12 +1606,12 @@ async def send_morning_hr_parlays_embed(channel, hot_streaks, two_hr_watch, toda
     parlays = build_stat_only_hr_parlay_picks(hot_streaks, two_hr_watch)
 
     if not any(parlays.values()):
-        await channel.send("💣 **Best HR Parlays Today**\nNo strong MLB stat-based HR parlay candidates found today.")
+        await safe_discord_send(channel, "💣 **Best HR Parlays Today**\nNo strong MLB stat-based HR parlay candidates found today.")
         return
 
     embed = discord.Embed(
         title="💣 Best HR Parlays Today",
-        description="Stat-only picks using MLB form, EV, near-HR contact, and pitcher matchup. No Odds API needed.",
+        description="Stat-only picks using MLB form, heavier EV weighting, near-HR contact, ballpark boost, barrel proxy, and pitcher matchup. No Odds API needed.",
         color=discord.Color.blue(),
     )
 
@@ -1488,7 +1620,7 @@ async def send_morning_hr_parlays_embed(channel, hot_streaks, two_hr_watch, toda
     embed.add_field(name=f"🔴 Bomb — {len(parlays['bomb'])} Legs", value=_format_stat_parlay_rows(parlays["bomb"]), inline=False)
     embed.set_footer(text="Stat model only. Add legs manually in your sportsbook. Bet responsibly.")
 
-    await channel.send(embed=embed)
+    await safe_discord_send(channel, embed=embed)
 
 
 
@@ -1509,14 +1641,14 @@ async def post_daily_hr_recap(force=False):
 
     try:
         if force:
-            await channel.send("Loading HR recap...")
+            await safe_discord_send(channel, "Loading HR recap...")
         recap = await asyncio.wait_for(
             asyncio.to_thread(build_yesterday_recap, target_date),
             timeout=REPORT_BUILD_TIMEOUT_SECONDS,
         )
 
         if force:
-            await channel.send("Loading hot streaks...")
+            await safe_discord_send(channel, "Loading hot streaks...")
         hot_streaks = await asyncio.wait_for(
             asyncio.to_thread(build_hot_streaks),
             timeout=REPORT_BUILD_TIMEOUT_SECONDS,
@@ -1525,7 +1657,7 @@ async def post_daily_hr_recap(force=False):
         today_games = await asyncio.to_thread(get_today_games)
 
         if force:
-            await channel.send("Building 2-HR Watch...")
+            await safe_discord_send(channel, "Building 2-HR Watch...")
         two_hr_watch = await asyncio.wait_for(
             asyncio.to_thread(build_2hr_watch, today_games, hot_streaks),
             timeout=REPORT_BUILD_TIMEOUT_SECONDS,
@@ -1537,19 +1669,19 @@ async def post_daily_hr_recap(force=False):
         )
 
     except asyncio.TimeoutError:
-        await channel.send("Report build timed out while MLB data was loading. Try again in a few minutes.")
+        await safe_discord_send(channel, "Report build timed out while MLB data was loading. Try again in a few minutes.")
         log.exception("Report build timed out")
         return
 
     except Exception as exc:
-        await channel.send(f"Could not build the HR recap right now. Error: `{type(exc).__name__}: {exc}`")
+        await safe_discord_send(channel, f"Could not build the HR recap right now. Error: `{type(exc).__name__}: {exc}`")
         log.exception("Failed building daily recap: %s", exc)
         return
 
     games = recap["games"]
 
     if not games:
-        await channel.send(f"💣 **Yesterday's HR Recap — {target_date}**\nNo home runs found.")
+        await safe_discord_send(channel, f"💣 **Yesterday's HR Recap — {target_date}**\nNo home runs found.")
     else:
         header = f"💣 **Yesterday's HR Recap — {target_date}**\nTotal HR: **{recap['total_hr']}** | Players: **{recap['unique_players']}**\n\n"
         lines = []
@@ -1560,7 +1692,7 @@ async def post_daily_hr_recap(force=False):
             lines.append("")
 
         for chunk in split_lines_into_chunks(header, lines):
-            await channel.send(chunk)
+            await safe_discord_send(channel, chunk)
 
     await safe_send_report_section("hot_streaks", send_hot_streaks_embed(channel, hot_streaks))
     await safe_send_report_section("2hr_watch", send_2hr_watch_embed(channel, two_hr_watch))
@@ -1677,13 +1809,19 @@ async def on_ready():
 async def on_message(message):
     if message.author.bot:
         return
+
+    if message.id in processed_message_ids:
+        return
+    processed_message_ids.add(message.id)
+    if len(processed_message_ids) > 500:
+        processed_message_ids.clear()
     content = message.content.strip().lower()
     if content == "!yhr":
-        await message.channel.send("Building yesterday's HR recap... this may take a moment while MLB data loads.")
+        await safe_discord_send(message.channel, "Building yesterday's HR recap... this may take a moment while MLB data loads.")
         await post_daily_hr_recap(force=True)
         return
     elif content == "!2hr":
-        await message.channel.send("Building 2-HR Watch... checking recent HR hitters only.")
+        await safe_discord_send(message.channel, "Building 2-HR Watch... checking recent HR hitters only.")
         try:
             hot_streaks = await asyncio.wait_for(
                 asyncio.to_thread(build_hot_streaks),
@@ -1695,34 +1833,34 @@ async def on_message(message):
                 timeout=REPORT_BUILD_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
-            await message.channel.send("2-HR Watch timed out while MLB data was loading. Try again in a few minutes.")
+            await safe_discord_send(message.channel, "2-HR Watch timed out while MLB data was loading. Try again in a few minutes.")
             log.exception("2HR command timed out")
             return
         except Exception as exc:
             log.exception("2HR command failed: %s", exc)
-            await message.channel.send("Could not build 2-HR Watch right now.")
+            await safe_discord_send(message.channel, "Could not build 2-HR Watch right now.")
             return
 
         await send_2hr_watch_embed(message.channel, two_hr_watch)
         return
 
     elif content == "!oddsdebug":
-        await message.channel.send(
+        await safe_discord_send(message.channel, 
             f"Odds debug: key_set={bool(ODDS_API_KEY)}, get_odds_json_exists={'get_odds_json' in globals()}, books={ODDS_BOOKMAKERS}"
         )
         return
 
     elif content == "!oddscache":
-        await message.channel.send(cache_status_text())
+        await safe_discord_send(message.channel, cache_status_text())
         return
 
     elif content == "!refreshhrparlays":
-        await message.channel.send("HR parlays are running in stat-only mode now — no Odds API refresh needed.")
+        await safe_discord_send(message.channel, "HR parlays are running in stat-only mode now — no Odds API refresh needed.")
         return
 
 
     elif content == "!hrparlays":
-        await message.channel.send("Building today’s best HR parlays... using cached odds when available.")
+        await safe_discord_send(message.channel, "Building today’s best HR parlays... using cached odds when available.")
         try:
             hot_streaks = await asyncio.to_thread(build_hot_streaks)
             today_games = await asyncio.to_thread(get_today_games)
@@ -1731,25 +1869,25 @@ async def on_message(message):
 
         except Exception as exc:
             log.exception("Morning HR parlays command failed: %s", exc)
-            await message.channel.send("Could not build HR parlays right now.")
+            await safe_discord_send(message.channel, "Could not build HR parlays right now.")
         return
 
     elif content == "!bday":
-        await message.channel.send("Checking today's birthday narrative...")
+        await safe_discord_send(message.channel, "Checking today's birthday narrative...")
         try:
             hot_streaks = await asyncio.to_thread(build_hot_streaks)
             today_games = await asyncio.to_thread(get_today_games)
             birthday_narratives = await asyncio.to_thread(build_birthday_narratives, today_games, hot_streaks)
         except Exception as exc:
             log.exception("Birthday command failed: %s", exc)
-            await message.channel.send("Could not load birthday data right now.")
+            await safe_discord_send(message.channel, "Could not load birthday data right now.")
             return
         await send_birthday_embed(message.channel, birthday_narratives)
         return
     elif content == "!schedulestatus":
         now = datetime.now(TZ)
         target_date = yesterday_str()
-        await message.channel.send(
+        await safe_discord_send(message.channel, 
             "Schedule status\n"
             f"Now: `{now.strftime('%Y-%m-%d %I:%M %p %Z')}`\n"
             f"Daily report time: `{DAILY_RECAP_HOUR}:{DAILY_RECAP_MINUTE:02d} {TIMEZONE}`\n"
@@ -1760,7 +1898,7 @@ async def on_message(message):
         return
 
     elif content == "!ktest":
-        await message.channel.send(
+        await safe_discord_send(message.channel, 
             f"Strikeout alerts: enabled={ENABLE_STRIKEOUT_ALERTS}, "
             f"channel_id={DISCORD_STRIKEOUT_CHANNEL_ID or 'main'}, "
             f"early={STRIKEOUT_ALERT_MIN_KS}+ Ks by inning {STRIKEOUT_ALERT_MAX_INNING}, extended={STRIKEOUT_EXTENDED_MIN_KS}+ Ks by inning {STRIKEOUT_EXTENDED_MAX_INNING}"
@@ -1768,7 +1906,8 @@ async def on_message(message):
         return
 
     elif content == "!ping":
-        await message.channel.send("pong")
+        await safe_discord_send(message.channel, "pong")
+        return
         return
 
 
