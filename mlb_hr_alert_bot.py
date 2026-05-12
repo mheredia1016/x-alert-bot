@@ -13,6 +13,8 @@ from zoneinfo import ZoneInfo
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
 DISCORD_STRIKEOUT_CHANNEL_ID = int(os.getenv("DISCORD_STRIKEOUT_CHANNEL_ID", "0"))
+DISCORD_HARD_HIT_CHANNEL_ID = int(os.getenv("DISCORD_HARD_HIT_CHANNEL_ID", "0"))
+DISCORD_PITCHER_WEAKSPOT_CHANNEL_ID = int(os.getenv("DISCORD_PITCHER_WEAKSPOT_CHANNEL_ID", "0"))
 ENABLE_STRIKEOUT_ALERTS = os.getenv("ENABLE_STRIKEOUT_ALERTS", "false").lower() == "true"
 STRIKEOUT_ALERT_MIN_KS = int(os.getenv("STRIKEOUT_ALERT_MIN_KS", "3"))
 STRIKEOUT_ALERT_MAX_INNING = int(os.getenv("STRIKEOUT_ALERT_MAX_INNING", "2"))
@@ -613,6 +615,18 @@ async def maybe_send_no_hr_3rd_alert(channel, game, plays):
 # HARD-HIT / PITCHER WEAKSPOT ALERTS
 # =========================
 
+
+async def get_optional_alert_channel(channel, channel_id, label):
+    if not channel_id:
+        return channel
+
+    try:
+        return await client.fetch_channel(channel_id)
+    except Exception as exc:
+        log.warning("Could not fetch %s channel %s: %s", label, channel_id, exc)
+        return channel
+
+
 async def maybe_send_hard_hit_tracker(channel, game, play, metrics):
     if not ENABLE_HARD_HIT_TRACKER or not metrics:
         return
@@ -664,7 +678,8 @@ async def maybe_send_hard_hit_tracker(channel, game, play, metrics):
     else:
         lines.append(f"Signal: 🔥 {hard_hit_tracker[key]} hard-hit balls today")
 
-    await safe_discord_send(channel, "\n".join(lines))
+    target_channel = await get_optional_alert_channel(channel, DISCORD_HARD_HIT_CHANNEL_ID, "hard-hit")
+    await safe_discord_send(target_channel, "\n".join(lines))
 
     state["seen_hard_hit_alerts"].append(key)
     save_state()
@@ -720,7 +735,8 @@ async def maybe_send_pitcher_weakspot_alert(channel, game, play, metrics):
     for hitter in list(pdata["targets"])[:3]:
         lines.append(f"• {hitter}")
 
-    await safe_discord_send(channel, "\n".join(lines))
+    target_channel = await get_optional_alert_channel(channel, DISCORD_PITCHER_WEAKSPOT_CHANNEL_ID, "pitcher weakspot")
+    await safe_discord_send(target_channel, "\n".join(lines))
 
     state["seen_pitcher_weakspot_alerts"].append(key)
     save_state()
@@ -2010,6 +2026,7 @@ async def on_ready():
         log.info("More HR odds enabled: %s", ENABLE_MORE_HR_ODDS)
         log.info("Morning HR parlays enabled: %s", ENABLE_MORNING_HR_PARLAYS)
         log.info("Strikeout alerts enabled: %s channel=%s", ENABLE_STRIKEOUT_ALERTS, DISCORD_STRIKEOUT_CHANNEL_ID or "main")
+        log.info("Hard-hit channel=%s pitcher weakspot channel=%s", DISCORD_HARD_HIT_CHANNEL_ID or "main", DISCORD_PITCHER_WEAKSPOT_CHANNEL_ID or "main")
     else:
         log.info("Live alert loop already running")
 
@@ -2103,6 +2120,17 @@ async def on_message(message):
             f"Target recap date: `{target_date}`\n"
             f"Last posted date: `{state.get('last_daily_recap_date')}`\n"
             f"Catch-up hours: `{DAILY_RECAP_CATCHUP_HOURS}`"
+        )
+        return
+
+    elif content == "!alertchannels":
+        await safe_discord_send(
+            message.channel,
+            "Alert channels\n"
+            f"Main HR: `{DISCORD_CHANNEL_ID}`\n"
+            f"Strikeouts: `{DISCORD_STRIKEOUT_CHANNEL_ID or 'main'}`\n"
+            f"Hard-Hit Tracker: `{DISCORD_HARD_HIT_CHANNEL_ID or 'main'}`\n"
+            f"Pitcher Weakspot: `{DISCORD_PITCHER_WEAKSPOT_CHANNEL_ID or 'main'}`"
         )
         return
 
