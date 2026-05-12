@@ -87,6 +87,8 @@ processing_near_play_ids = set()
 morning_hr_odds_cache = {"fetched_at": None, "rows": []}
 daily_recap_running = False
 processed_message_ids = set()
+hard_hit_tracker = {}
+pitcher_hard_hit_tracker = {}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("mlb_hr_alert_bot")
@@ -371,6 +373,85 @@ def play_is_recent(play):
 
 
 
+
+# =========================
+# HARD HIT / WEAKSPOT HELPERS
+# =========================
+
+async def maybe_send_hard_hit_tracker(channel, game_pk, batter_name, team_abbr, metrics, hard_hit_counts):
+    if not ENABLE_HARD_HIT_TRACKER:
+        return
+
+    ev = metrics.get("ev")
+    if not ev:
+        return
+
+    player_key = f"{game_pk}:{batter_name}"
+
+    state.setdefault("seen_hard_hit_alerts", [])
+
+    if player_key in state["seen_hard_hit_alerts"]:
+        return
+
+    count = hard_hit_counts.get(player_key, 0)
+
+    if ev < ELITE_HARD_HIT_EV and count < 2:
+        return
+
+    msg = [
+        "🔥 **Hard-Hit Tracker**",
+        "",
+        f"**{batter_name} ({team_abbr})**",
+        f"EV: {ev:.1f} mph"
+    ]
+
+    if metrics.get("distance"):
+        msg.append(f"Distance: {metrics['distance']:.0f} ft")
+
+    if ev >= ELITE_HARD_HIT_EV:
+        msg.append("Signal: 💣 Elite contact")
+    else:
+        msg.append(f"Signal: 🔥 {count} hard-hit balls today")
+
+    await safe_discord_send(channel, "\n".join(msg))
+
+    state["seen_hard_hit_alerts"].append(player_key)
+    save_state()
+
+
+async def maybe_send_pitcher_weakspot_alert(channel, game_pk, pitcher_name, pdata):
+    if not ENABLE_PITCHER_WEAKSPOT_ALERTS:
+        return
+
+    state.setdefault("seen_pitcher_weakspot_alerts", [])
+
+    key = f"{game_pk}:{pitcher_name}"
+
+    if key in state["seen_pitcher_weakspot_alerts"]:
+        return
+
+    if pdata["count"] < 3 and pdata["hardest_ev"] < 100:
+        return
+
+    msg = [
+        "🚨 **Pitcher Weakspot**",
+        "",
+        f"**{pitcher_name}** is getting hit hard",
+        f"Hard-hit balls allowed: {pdata['count']}",
+        f"Hardest EV: {pdata['hardest_ev']:.1f} mph",
+        "",
+        "Potential HR targets:"
+    ]
+
+    for hitter in list(pdata["targets"])[:3]:
+        msg.append(f"• {hitter}")
+
+    await safe_discord_send(channel, "\n".join(msg))
+
+    state["seen_pitcher_weakspot_alerts"].append(key)
+    save_state()
+
+
 # =========================
 # DISCORD SEND RATE LIMIT PROTECTION
 # =========================
@@ -460,6 +541,9 @@ async def send_alert(channel, game, play, alert_type, all_plays=None):
         embed.set_image(url=headshot_url)
     embed.set_footer(text="MLB live feed")
     await safe_discord_send(channel, embed=embed)
+
+    await send_hr_matchup_dashboard(channel, parlays)
+    await send_barrel_zone_dashboard(channel, parlays)
 
     if (
         alert_type == "hr"
@@ -1597,6 +1681,68 @@ def _format_stat_parlay_rows(rows):
         lines.append(f"• **{row['name']} ({row.get('team_abbr', 'MLB')})** — Score {row['final_score']}\n  {detail_text}")
 
     return "\n".join(lines)
+
+
+
+async def send_hr_matchup_dashboard(channel, parlays):
+    embed = discord.Embed(
+        title="💣 HR Matchup",
+        description="Top HR environments for today's slate",
+        color=discord.Color.red(),
+    )
+
+    combined = (parlays.get("safe", []) + parlays.get("risky", []))[:8]
+
+    for row in combined:
+        details = []
+
+        if row.get("last_7_hr"):
+            details.append(f"{row['last_7_hr']} HR last 7d")
+
+        if row.get("max_ev"):
+            details.append(f"{float(row['max_ev']):.1f} EV")
+
+        if row.get("ballpark_boost"):
+            details.append(f"park {row['ballpark_boost']:+}")
+
+        embed.add_field(
+            name=f"{row['name']} ({row.get('team_abbr','MLB')})",
+            value=" | ".join(details),
+            inline=False
+        )
+
+    await safe_discord_send(channel, embed=embed)
+
+
+async def send_barrel_zone_dashboard(channel, parlays):
+    embed = discord.Embed(
+        title="🎯 Barrel Zone Matchups",
+        description="Elite power profiles entering today's games",
+        color=discord.Color.gold(),
+    )
+
+    candidates = sorted(
+        parlays.get("bomb", []) + parlays.get("risky", []),
+        key=lambda x: x.get("barrel_proxy", 0),
+        reverse=True
+    )[:6]
+
+    for row in candidates:
+        details = []
+
+        if row.get("barrel_proxy"):
+            details.append(f"barrel proxy +{row['barrel_proxy']}")
+
+        if row.get("max_ev"):
+            details.append(f"{float(row['max_ev']):.1f} max EV")
+
+        embed.add_field(
+            name=f"{row['name']} ({row.get('team_abbr','MLB')})",
+            value=" | ".join(details),
+            inline=False
+        )
+
+    await safe_discord_send(channel, embed=embed)
 
 
 async def send_morning_hr_parlays_embed(channel, hot_streaks, two_hr_watch, today_games):
