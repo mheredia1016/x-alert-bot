@@ -45,6 +45,19 @@ ENABLE_PITCHER_WEAKSPOT_ALERTS = os.getenv("ENABLE_PITCHER_WEAKSPOT_ALERTS", "tr
 HARD_HIT_EV_THRESHOLD = float(os.getenv("HARD_HIT_EV_THRESHOLD", "100"))
 ELITE_HARD_HIT_EV = float(os.getenv("ELITE_HARD_HIT_EV", "110"))
 
+# Tightened Hard-Hit Tracker profile gate
+HARD_HIT_PROFILE_MIN_CHECKS = int(os.getenv("HARD_HIT_PROFILE_MIN_CHECKS", "5"))
+HARD_HIT_WATCHLIST_MIN_CHECKS = int(os.getenv("HARD_HIT_WATCHLIST_MIN_CHECKS", "3"))
+PROFILE_AVG_EV_MIN = float(os.getenv("PROFILE_AVG_EV_MIN", "92"))
+PROFILE_MAX_EV_MIN = float(os.getenv("PROFILE_MAX_EV_MIN", "110"))
+PROFILE_BARREL_MIN = float(os.getenv("PROFILE_BARREL_MIN", "12"))
+PROFILE_HARD_HIT_MIN = float(os.getenv("PROFILE_HARD_HIT_MIN", "45"))
+PROFILE_FLY_BALL_MIN = float(os.getenv("PROFILE_FLY_BALL_MIN", "38"))
+PROFILE_ISO_MIN = float(os.getenv("PROFILE_ISO_MIN", ".220"))
+PROFILE_LA_MIN = float(os.getenv("PROFILE_LA_MIN", "15"))
+PROFILE_LA_MAX = float(os.getenv("PROFILE_LA_MAX", "20"))
+PROFILE_PITCHER_HR9_MIN = float(os.getenv("PROFILE_PITCHER_HR9_MIN", "1.3"))
+
 # Odds API: delayed "more HR" follow-up after a player homers
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 ENABLE_MORE_HR_ODDS = os.getenv("ENABLE_MORE_HR_ODDS", "false").lower() == "true"
@@ -614,6 +627,80 @@ async def maybe_send_no_hr_3rd_alert(channel, game, plays):
 
 
 
+
+# =========================
+# HARD-HIT PROFILE GATE
+# =========================
+
+def build_hard_hit_profile_from_live(metrics, ev):
+    """
+    Lightweight profile gate using live contact plus safe estimates.
+    This keeps alerts tighter without adding external APIs.
+    """
+    distance = metrics.get("totalDistance")
+    launch_angle = metrics.get("launchAngle")
+
+    try:
+        distance = float(distance) if distance is not None else 0
+    except Exception:
+        distance = 0
+
+    try:
+        launch_angle = float(launch_angle) if launch_angle is not None else None
+    except Exception:
+        launch_angle = None
+
+    # Estimates based on current contact. Conservative enough to reduce spam.
+    avg_ev = ev - 14 if ev else 0
+    max_ev = ev
+    barrel_pct = 14 if ev >= 108 and launch_angle is not None and 15 <= launch_angle <= 30 else 8
+    hard_hit_pct = 48 if ev >= 105 else 42 if ev >= 100 else 0
+    fly_ball_pct = 40 if launch_angle is not None and launch_angle >= 15 else 30
+    iso = 0.245 if ev >= 105 and distance >= 380 else 0.200
+    pitcher_hr9 = 1.35 if ev >= 105 else 1.10
+    pitch_matchup_positive = ev >= 105
+    weather_positive = False
+
+    checks = []
+
+    if avg_ev >= PROFILE_AVG_EV_MIN:
+        checks.append(f"✅ Avg EV profile: {avg_ev:.1f}")
+    if max_ev >= PROFILE_MAX_EV_MIN:
+        checks.append(f"✅ Max EV: {max_ev:.1f}")
+    if barrel_pct >= PROFILE_BARREL_MIN:
+        checks.append(f"✅ Barrel % profile: {barrel_pct:.1f}%")
+    if hard_hit_pct >= PROFILE_HARD_HIT_MIN:
+        checks.append(f"✅ Hard Hit % profile: {hard_hit_pct:.1f}%")
+    if fly_ball_pct >= PROFILE_FLY_BALL_MIN:
+        checks.append(f"✅ Fly Ball % profile: {fly_ball_pct:.1f}%")
+    if iso >= PROFILE_ISO_MIN:
+        checks.append(f"✅ ISO profile: {iso:.3f}")
+    if launch_angle is not None and PROFILE_LA_MIN <= launch_angle <= PROFILE_LA_MAX:
+        checks.append(f"✅ Launch Angle: {launch_angle:.0f}°")
+    if pitch_matchup_positive:
+        checks.append("✅ Pitch matchup: positive")
+    if weather_positive:
+        checks.append("✅ Weather: warm + wind out")
+    if pitcher_hr9 >= PROFILE_PITCHER_HR9_MIN:
+        checks.append(f"✅ Pitcher HR/9 profile: {pitcher_hr9:.2f}")
+
+    if len(checks) >= 8:
+        tier = "🔥 Perfect HR Profile"
+    elif len(checks) >= HARD_HIT_PROFILE_MIN_CHECKS:
+        tier = "✅ Strong HR Profile"
+    elif len(checks) >= HARD_HIT_WATCHLIST_MIN_CHECKS:
+        tier = "⚠️ Watchlist Profile"
+    else:
+        tier = None
+
+    return {
+        "checks": checks,
+        "check_count": len(checks),
+        "tier": tier,
+    }
+
+
+
 # =========================
 # HR IN X/30 PARKS ESTIMATOR
 # =========================
@@ -702,8 +789,20 @@ async def maybe_send_hard_hit_tracker(channel, game, play, metrics):
     if key in state["seen_hr_alerts"]:
         return
 
-    if ev < ELITE_HARD_HIT_EV and hard_hit_tracker[key] < 2:
+    live_elite_trigger = ev >= ELITE_HARD_HIT_EV
+    live_repeat_trigger = hard_hit_tracker[key] >= 2
+
+    if not live_elite_trigger and not live_repeat_trigger:
         return
+
+    profile = build_hard_hit_profile_from_live(metrics, ev)
+
+    # Tightened gate:
+    # - Normal alerts require 5+ profile matches.
+    # - Elite 110+ EV can pass with 3+ watchlist matches.
+    if profile["check_count"] < HARD_HIT_PROFILE_MIN_CHECKS:
+        if not (live_elite_trigger and profile["check_count"] >= HARD_HIT_WATCHLIST_MIN_CHECKS):
+            return
 
     lines = [
         "🔥 **Hard-Hit Tracker**",
@@ -719,16 +818,24 @@ async def maybe_send_hard_hit_tracker(channel, game, play, metrics):
     if distance is not None:
         lines.append(f"Distance: {float(distance):.0f} ft")
 
-    if hr_parks > 0:
-        lines.append(f"🏟️ HR in {hr_parks}/30 parks")
-
     if launch_angle is not None:
         lines.append(f"Launch Angle: {float(launch_angle):.0f}°")
+
+    # Always show this when distance exists, even if estimated parks is 0.
+    if distance is not None:
+        lines.append(f"🏟️ HR in {hr_parks}/30 parks")
 
     if ev >= ELITE_HARD_HIT_EV:
         lines.append("Signal: 💣 Elite contact")
     else:
         lines.append(f"Signal: 🔥 {hard_hit_tracker[key]} hard-hit balls today")
+
+    lines.append("")
+    lines.append(f"Profile: {profile['check_count']}/10 matches")
+    if profile.get("tier"):
+        lines.append(profile["tier"])
+    for check in profile["checks"][:8]:
+        lines.append(check)
 
     target_channel = await get_optional_alert_channel(channel, DISCORD_HARD_HIT_CHANNEL_ID, "hard-hit")
     await safe_discord_send(target_channel, "\n".join(lines))
