@@ -188,6 +188,7 @@ def save_state():
     state["seen_near_hr_play_ids"] = state["seen_near_hr_play_ids"][-1000:]
     state["pending_near_hr_play_ids"] = state["pending_near_hr_play_ids"][-1000:]
     state["seen_strikeout_alerts"] = state.get("seen_strikeout_alerts", [])[-500:]
+    state["seen_hr_alerts"] = state.get("seen_hr_alerts", [])[-500:]
     for extra_key in ("seen_no_hr_3rd_game_ids", "seen_more_hr_odds_keys", "seen_pregame_parlay_game_ids"):
         if extra_key in state:
             state[extra_key] = state[extra_key][-500:]
@@ -701,6 +702,15 @@ def build_hard_hit_profile_from_live(metrics, ev):
 
 
 
+
+def player_game_key(game, play):
+    matchup = play.get("matchup", {}) or {}
+    batter = matchup.get("batter", {}) or {}
+    batter_id = batter.get("id")
+    batter_name = batter.get("fullName", "Unknown")
+    return f"{game.get('gamePk')}:{batter_id or batter_name}"
+
+
 # =========================
 # HR IN X/30 PARKS ESTIMATOR
 # =========================
@@ -757,6 +767,10 @@ async def maybe_send_hard_hit_tracker(channel, game, play, metrics):
     if not ENABLE_HARD_HIT_TRACKER or not metrics:
         return
 
+    # Never send hard-hit tracker for the actual HR play
+    if is_home_run(play):
+        return
+
     ev = metrics.get("launchSpeed")
     if ev is None:
         return
@@ -776,7 +790,7 @@ async def maybe_send_hard_hit_tracker(channel, game, play, metrics):
     team = game["away"] if about.get("halfInning") == "top" else game["home"]
     team_abbr = team.get("abbreviation", "MLB")
 
-    key = f"{game.get('gamePk')}:{batter.get('id') or batter_name}"
+    key = player_game_key(game, play)
     hard_hit_tracker[key] = hard_hit_tracker.get(key, 0) + 1
 
     state.setdefault("seen_hard_hit_alerts", [])
@@ -874,6 +888,7 @@ async def maybe_send_pitcher_weakspot_alert(channel, game, play, metrics):
             "elite_count": 0,
             "hardest_ev": 0.0,
             "targets": set(),
+            "target_keys": {},
         },
     )
     pdata["count"] += 1
@@ -882,7 +897,11 @@ async def maybe_send_pitcher_weakspot_alert(channel, game, play, metrics):
         pdata["elite_count"] += 1
 
     pdata["hardest_ev"] = max(float(pdata["hardest_ev"]), ev)
-    pdata["targets"].add(batter.get("fullName", "Unknown"))
+    batter_name = batter.get("fullName", "Unknown")
+    batter_key = player_game_key(game, play)
+    pdata["targets"].add(batter_name)
+    pdata.setdefault("target_keys", {})
+    pdata["target_keys"][batter_name] = batter_key
     pitcher_hard_hit_tracker[key] = pdata
 
     state.setdefault("seen_pitcher_weakspot_alerts", [])
@@ -909,7 +928,21 @@ async def maybe_send_pitcher_weakspot_alert(channel, game, play, metrics):
         "Potential HR targets:",
     ]
 
-    for hitter in list(pdata["targets"])[:3]:
+    state.setdefault("seen_hr_alerts", [])
+
+    eligible_targets = []
+    target_keys = pdata.get("target_keys", {})
+
+    for hitter in list(pdata["targets"]):
+        hitter_key = target_keys.get(hitter)
+        if hitter_key and hitter_key in state["seen_hr_alerts"]:
+            continue
+        eligible_targets.append(hitter)
+
+    if not eligible_targets:
+        return
+
+    for hitter in eligible_targets[:3]:
         lines.append(f"• {hitter}")
 
     target_channel = await get_optional_alert_channel(channel, DISCORD_PITCHER_WEAKSPOT_CHANNEL_ID, "pitcher weakspot")
@@ -1127,6 +1160,12 @@ async def process_game(channel, game):
             await maybe_send_pitcher_weakspot_alert(channel, game, play, metrics)
 
         if is_home_run(play):
+            state.setdefault("seen_hr_alerts", [])
+            hr_player_key = player_game_key(game, play)
+            if hr_player_key not in state["seen_hr_alerts"]:
+                state["seen_hr_alerts"].append(hr_player_key)
+                save_state()
+
             if pid in processing_play_ids:
                 continue
 
