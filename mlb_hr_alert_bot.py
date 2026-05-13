@@ -611,6 +611,43 @@ async def maybe_send_no_hr_3rd_alert(channel, game, plays):
 
 
 
+
+# =========================
+# HR IN X/30 PARKS ESTIMATOR
+# =========================
+
+def estimate_hr_parks(distance, ev, launch_angle=None):
+    try:
+        distance = float(distance or 0)
+        ev = float(ev or 0)
+        launch_angle = float(launch_angle or 0)
+    except Exception:
+        return 0
+
+    if distance >= 430:
+        return 30
+    if distance >= 425:
+        return 29
+    if distance >= 420:
+        return 27
+    if distance >= 415:
+        return 25
+    if distance >= 410:
+        return 23
+    if distance >= 405:
+        return 20
+    if distance >= 400 and ev >= 108:
+        return 18
+    if distance >= 395 and ev >= 106:
+        return 15
+    if distance >= 390 and ev >= 104:
+        return 12
+    if distance >= 375 and ev >= 102 and 15 <= launch_angle <= 25:
+        return 6
+
+    return 0
+
+
 # =========================
 # HARD-HIT / PITCHER WEAKSPOT ALERTS
 # =========================
@@ -668,27 +705,23 @@ async def maybe_send_hard_hit_tracker(channel, game, play, metrics):
         f"EV: {ev:.1f} mph",
     ]
 
-    if metrics.get("totalDistance") is not None:
-        lines.append(f"Distance: {metrics['totalDistance']} ft")
-    if metrics.get("launchAngle") is not None:
-        lines.append(f"Launch Angle: {metrics['launchAngle']}°")
+    distance = metrics.get("totalDistance")
+    launch_angle = metrics.get("launchAngle")
+    hr_parks = estimate_hr_parks(distance, ev, launch_angle)
+
+    if distance is not None:
+        lines.append(f"Distance: {float(distance):.0f} ft")
+
+    if hr_parks > 0:
+        lines.append(f"🏟️ HR in {hr_parks}/30 parks")
+
+    if launch_angle is not None:
+        lines.append(f"Launch Angle: {float(launch_angle):.0f}°")
 
     if ev >= ELITE_HARD_HIT_EV:
         lines.append("Signal: 💣 Elite contact")
     else:
         lines.append(f"Signal: 🔥 {hard_hit_tracker[key]} hard-hit balls today")
-
-    hr_parks = estimate_hr_parks(
-        metrics.get("distance"),
-        ev,
-        metrics.get("launch")
-    )
-
-    if metrics.get("distance"):
-        msg.append(f"Distance: {metrics['distance']:.0f} ft")
-
-    if hr_parks > 0:
-        msg.append(f"🏟️ HR in {hr_parks}/30 parks")
 
     target_channel = await get_optional_alert_channel(channel, DISCORD_HARD_HIT_CHANNEL_ID, "hard-hit")
     await safe_discord_send(target_channel, "\n".join(lines))
