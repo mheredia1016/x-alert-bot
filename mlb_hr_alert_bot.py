@@ -118,6 +118,7 @@ state = {
     "seen_no_hr_3rd_game_ids": [],
     "seen_more_hr_odds_keys": [],
     "seen_hard_hit_alerts": [],
+    "seen_hr_alerts": [],
     "seen_pitcher_weakspot_alerts": [],
 }
 
@@ -165,6 +166,7 @@ def load_state():
     state.setdefault("seen_no_hr_3rd_game_ids", [])
     state.setdefault("seen_more_hr_odds_keys", [])
     state.setdefault("seen_hard_hit_alerts", [])
+    state.setdefault("seen_hr_alerts", [])
     state.setdefault("seen_pitcher_weakspot_alerts", [])
 
 
@@ -695,6 +697,11 @@ async def maybe_send_hard_hit_tracker(channel, game, play, metrics):
     if key in state["seen_hard_hit_alerts"]:
         return
 
+    # Don't send hard-hit alerts after the player already homered
+    state.setdefault("seen_hr_alerts", [])
+    if key in state["seen_hr_alerts"]:
+        return
+
     if ev < ELITE_HARD_HIT_EV and hard_hit_tracker[key] < 2:
         return
 
@@ -776,12 +783,12 @@ async def maybe_send_pitcher_weakspot_alert(channel, game, play, metrics):
     if key in state["seen_pitcher_weakspot_alerts"]:
         return
 
-    # Stricter trigger so this feels different from Hard-Hit Tracker
-    # Requires multiple hard-hit balls AND at least 2 elite contacts.
-    if pdata["count"] < 4:
+    # Tightened Pitcher Weakspot trigger
+    # Only alert when a pitcher is consistently getting crushed.
+    if pdata["count"] < 5:
         return
 
-    if pdata.get("elite_count", 0) < 2:
+    if pdata.get("elite_count", 0) < 3:
         return
 
     lines = [
