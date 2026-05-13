@@ -708,8 +708,20 @@ async def maybe_send_pitcher_weakspot_alert(channel, game, play, metrics):
     pitcher_name = pitcher.get("fullName", "Unknown")
     key = f"{game.get('gamePk')}:{pitcher.get('id') or pitcher_name}"
 
-    pdata = pitcher_hard_hit_tracker.get(key, {"count": 0, "hardest_ev": 0.0, "targets": set()})
+    pdata = pitcher_hard_hit_tracker.get(
+        key,
+        {
+            "count": 0,
+            "elite_count": 0,
+            "hardest_ev": 0.0,
+            "targets": set(),
+        },
+    )
     pdata["count"] += 1
+
+    if ev >= 100:
+        pdata["elite_count"] += 1
+
     pdata["hardest_ev"] = max(float(pdata["hardest_ev"]), ev)
     pdata["targets"].add(batter.get("fullName", "Unknown"))
     pitcher_hard_hit_tracker[key] = pdata
@@ -719,14 +731,20 @@ async def maybe_send_pitcher_weakspot_alert(channel, game, play, metrics):
     if key in state["seen_pitcher_weakspot_alerts"]:
         return
 
-    if pdata["count"] < 3 and pdata["hardest_ev"] < 100:
+    # Stricter trigger so this feels different from Hard-Hit Tracker
+    # Requires multiple hard-hit balls AND at least 2 elite contacts.
+    if pdata["count"] < 4:
+        return
+
+    if pdata.get("elite_count", 0) < 2:
         return
 
     lines = [
         "🚨 **Pitcher Weakspot**",
         "",
-        f"**{pitcher_name}** is getting hit hard",
+        f"**{pitcher_name}** is getting squared up repeatedly",
         f"Hard-hit balls allowed: {pdata['count']}",
+        f"100+ EV balls allowed: {pdata.get('elite_count', 0)}",
         f"Hardest EV: {pdata['hardest_ev']:.1f} mph",
         "",
         "Potential HR targets:",
