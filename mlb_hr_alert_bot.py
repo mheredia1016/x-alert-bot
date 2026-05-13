@@ -678,6 +678,18 @@ async def maybe_send_hard_hit_tracker(channel, game, play, metrics):
     else:
         lines.append(f"Signal: 🔥 {hard_hit_tracker[key]} hard-hit balls today")
 
+    hr_parks = estimate_hr_parks(
+        metrics.get("distance"),
+        ev,
+        metrics.get("launch")
+    )
+
+    if metrics.get("distance"):
+        msg.append(f"Distance: {metrics['distance']:.0f} ft")
+
+    if hr_parks > 0:
+        msg.append(f"🏟️ HR in {hr_parks}/30 parks")
+
     target_channel = await get_optional_alert_channel(channel, DISCORD_HARD_HIT_CHANNEL_ID, "hard-hit")
     await safe_discord_send(target_channel, "\n".join(lines))
 
