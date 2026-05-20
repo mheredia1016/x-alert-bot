@@ -1492,442 +1492,424 @@ def collect_recent_contact_for_players(player_ids, days: int = 3):
     return results
 
 
-def build_2hr_watch(today_games, hot_streaks, top_n: int = TWO_HR_WATCH_TOP_N):
-    """
-    Fast MLB-only 2-HR Watch.
-    Always shows top recent HR hitters when possible, but avoids per-player game-feed scans.
-    """
-    if not ENABLE_2HR_WATCH:
-        return []
-
-    candidates = []
-    pitcher_hr9_cache = {}
-
-    # Map team keys -> today's game/team id.
-    team_context = {}
-    for game in today_games:
-        for team in (game.get("away") or {}, game.get("home") or {}):
-            keys = [
-                team.get("abbreviation"),
-                team.get("teamName"),
-                team.get("name"),
-                team.get("fileCode"),
-            ]
-            team_id = team.get("id")
-            for key in keys:
-                if key:
-                    team_context[str(key).upper()] = {
-                        "team_id": team_id,
-                        "game": game,
-                    }
-
-    # Only evaluate recent HR hitters, not every active player.
-    pool = hot_streaks[: max(top_n * 4, 20)]
-    candidate_ids = [row.get("player_id") for row in pool if row.get("player_id")]
-    contact_cache = collect_recent_contact_for_players(candidate_ids, days=3)
-
-    for hot in pool:
-        player_id = hot.get("player_id")
-        player_name = hot.get("name", "Unknown")
-        team_abbr = hot.get("team_abbr", "MLB")
-        last_7_hr = int(hot.get("total_hr", 0) or 0)
-        streak_days = int(hot.get("streak_days", 0) or 0)
-
-        if last_7_hr <= 0:
-            continue
-
-        context = team_context.get(str(team_abbr).upper())
-
-        game = context["game"] if context else None
-        team_id = context["team_id"] if context else None
-
-        pitcher_name = "TBD"
-        pitcher_hr9 = None
-
-        if game and team_id:
-            probable_pitcher = get_probable_pitcher_for_team(game, team_id)
-            pitcher_id = probable_pitcher.get("id") if probable_pitcher else None
-            pitcher_name = probable_pitcher.get("fullName") if probable_pitcher else "TBD"
-
-            if pitcher_id and pitcher_id not in pitcher_hr9_cache:
-                pitcher_hr9_cache[pitcher_id] = get_pitcher_hr_per_9(pitcher_id)
-
-            pitcher_hr9 = pitcher_hr9_cache.get(pitcher_id) if pitcher_id else None
-
-        contact = contact_cache.get(player_id, {"near_hr_count": 0, "max_ev": None, "last_hr_ev": None})
-        near_hr_count = int(contact.get("near_hr_count", 0) or 0)
-        max_ev = contact.get("max_ev")
-        last_hr_ev = contact.get("last_hr_ev")
-
-        score = 0
-        score += last_7_hr * 12
-        score += streak_days * 7
-        score += near_hr_count * 8
-
-        if last_hr_ev:
-            score += max(0, last_hr_ev - 95) * 0.8
-        elif max_ev:
-            score += max(0, max_ev - 98) * 0.5
-
-        if pitcher_hr9:
-            score += pitcher_hr9 * 10
-
-        score = round(score)
-
-        if score >= 55:
-            confidence = "High"
-        elif score >= 30:
-            confidence = "Medium"
-        else:
-            confidence = "Low"
-
-        candidates.append({
-            "player_id": player_id,
-            "name": player_name,
-            "team_abbr": team_abbr,
-            "game": game_label(game) if game else "Game match TBD",
-            "ballpark_boost": get_ballpark_boost_from_game_label(game_label(game)) if game else 0,
-            "last_7_hr": last_7_hr,
-            "streak_days": streak_days,
-            "near_hr_count": near_hr_count,
-            "max_ev": max_ev,
-            "last_hr_ev": last_hr_ev,
-            "pitcher_name": pitcher_name,
-            "pitcher_hr9": pitcher_hr9,
-            "score": score,
-            "confidence": confidence,
-        })
-
-    candidates.sort(key=lambda x: (-x["score"], -x["last_7_hr"], -x["near_hr_count"], x["name"]))
-    return candidates[:top_n]
-
-
-async def send_2hr_watch_embed(channel, two_hr_watch):
-    if not ENABLE_2HR_WATCH:
-        return
-    if not two_hr_watch:
-        await safe_discord_send(channel, "💥 **2-HR Watch**\nNo recent HR hitters found for today’s slate.")
-        return
-    embed = discord.Embed(title="💥 2-HR Watch", color=discord.Color.red(), description="MLB-only model: recent HR form, near-HR contact, EV, and opposing probable pitcher HR/9")
-    for idx, row in enumerate(two_hr_watch, start=1):
-        lines = [f"• {row['last_7_hr']} HR last {HOT_STREAK_DAYS} days"]
-        if row["near_hr_count"] > 0:
-            lines.append(f"• {row['near_hr_count']} near-HR balls last 3 games")
-        if row["last_hr_ev"]:
-            lines.append(f"• {row['last_hr_ev']:.1f} EV last HR")
-        elif row["max_ev"]:
-            lines.append(f"• {row['max_ev']:.1f} max EV last 3 games")
-        if row["pitcher_hr9"] is not None:
-            lines.append(f"• Faces {row['pitcher_name']} allowing {row['pitcher_hr9']} HR/9")
-        else:
-            lines.append("• Opposing probable pitcher HR/9: TBD")
-        lines.append(f"• Score: {row['score']}")
-        if row.get("confidence"):
-            lines.append(f"• Confidence: {row['confidence']}")
-        embed.add_field(name=f"{idx}. {row['name']} ({row['team_abbr']})", value="\n".join(lines), inline=False)
-    embed.set_footer(text="Not betting advice. Score is a simple signal model from MLB Stats API data.")
-    await safe_discord_send(channel, embed=embed)
-
-
-async def send_birthday_embed(channel, birthday_narratives):
-    if not ENABLE_BIRTHDAY_NARRATIVE:
-        return
-    if not birthday_narratives:
-        await safe_discord_send(channel, "🎂 **Birthday Narrative Watch**\nNo active roster birthday matches found for teams playing today.")
-        return
-    embed = discord.Embed(title="🎂 Birthday Narrative Watch", color=discord.Color.magenta(), description="Active roster players with birthdays today whose team plays today")
-    for player in birthday_narratives[:10]:
-        age_text = f"turns {player['age']} today" if player["age"] else "birthday today"
-        streak_text = ""
-        if player["last_7_hr"] > 0:
-            streak_text = f"\n{player['last_7_hr']} HR in last {HOT_STREAK_DAYS} days"
-            if player["streak_days"] > 0:
-                streak_text += f" | {player['streak_days']} straight-day streak"
-        embed.add_field(name=f"{player['name']} ({player['team_abbr']})", value=f"{age_text}\n{player['game']}{streak_text}", inline=False)
-    headshot = player_headshot(birthday_narratives[0].get("player_id"))
-    if headshot:
-        embed.set_thumbnail(url=headshot)
-    embed.set_footer(text="Birthday note means active roster + team has a game today; lineup not guaranteed.")
-    await safe_discord_send(channel, embed=embed)
-
-
-
-def split_lines_into_chunks(header: str, lines: list[str], limit: int = 1900):
-    chunks = []
-    current = header
-
-    for line in lines:
-        addition = f"{line}\n"
-
-        if len(current) + len(addition) > limit:
-            chunks.append(current.rstrip())
-            current = addition
-        else:
-            current += addition
-
-    if current.strip():
-        chunks.append(current.rstrip())
-
-    return chunks
-
-
-
 
 # =========================
-# ODDS CACHE / MORNING PARLAY HELPERS
+# TODAY-FIRST HR REPORT ENGINE
 # =========================
 
-def cache_status_text():
-    return "Odds cache disabled / not loaded. Stat-only parlays do not need Odds API."
+def get_ballpark_boost_from_game_label(label):
+    boosts = {
+        "Colorado Rockies": 12,
+        "Cincinnati Reds": 8,
+        "New York Yankees": 7,
+        "Philadelphia Phillies": 5,
+        "Boston Red Sox": 4,
+        "Chicago White Sox": 4,
+        "Baltimore Orioles": 3,
+        "Houston Astros": 3,
+        "Arizona Diamondbacks": 2,
+        "Texas Rangers": 2,
+        "Los Angeles Dodgers": 1,
+        "Atlanta Braves": 1,
+        "San Francisco Giants": -6,
+        "Seattle Mariners": -4,
+        "Detroit Tigers": -3,
+        "New York Mets": -3,
+        "Miami Marlins": -2,
+        "San Diego Padres": -2,
+        "Tampa Bay Rays": -2,
+    }
 
+    lower = (label or "").lower()
 
-def build_today_hr_odds_rows(today_games, force_refresh=False):
-    return []
-
-# =========================
-# SAFE FALLBACK EMBEDS / OPTIONAL FEATURES
-# =========================
-
-async def send_hot_streaks_embed(channel, hot_streaks):
-    """
-    Safe fallback in case a previous build references this function.
-    Posts hot streaks without crashing the scheduler.
-    """
-    if not hot_streaks:
-        return
-
-    embed = discord.Embed(
-        title=f"🔥 Hot HR Streaks (Last {HOT_STREAK_DAYS} Days)",
-        color=discord.Color.gold(),
-    )
-
-    for row in hot_streaks[:HOT_STREAK_TOP_N]:
-        streak_days = int(row.get("streak_days", 0) or 0)
-        streak_text = f"{streak_days} straight day" if streak_days == 1 else f"{streak_days} straight days"
-        if streak_days == 0:
-            streak_text = "No current streak"
-
-        embed.add_field(
-            name=f"{row.get('name', 'Unknown')} ({row.get('team_abbr', 'MLB')})",
-            value=f"{row.get('total_hr', 0)} HR last {HOT_STREAK_DAYS} days\n{streak_text}",
-            inline=False,
-        )
-
-    await safe_discord_send(channel, embed=embed)
-
-
-async def send_more_hr_odds_after_delay(*args, **kwargs):
-    """
-    No-op fallback. Keeps HR alerts from crashing if MORE_HR odds are disabled
-    or if the full Odds API follow-up module is not present.
-    """
-    return
-
-
-
-
-
-# =========================
-# ADVANCED HR PARLAY SIGNALS
-# =========================
-
-BALLPARK_HR_BOOST = {
-    "Colorado Rockies": 12,
-    "Cincinnati Reds": 8,
-    "New York Yankees": 7,
-    "Philadelphia Phillies": 5,
-    "Boston Red Sox": 4,
-    "Chicago White Sox": 4,
-    "Baltimore Orioles": 3,
-    "Houston Astros": 3,
-    "Arizona Diamondbacks": 2,
-    "Texas Rangers": 2,
-    "Los Angeles Dodgers": 1,
-    "Atlanta Braves": 1,
-
-    "San Francisco Giants": -6,
-    "Seattle Mariners": -4,
-    "Detroit Tigers": -3,
-    "New York Mets": -3,
-    "Miami Marlins": -2,
-    "San Diego Padres": -2,
-    "Tampa Bay Rays": -2,
-}
-
-
-def get_ballpark_boost_from_game_label(game_label_text):
-    text = (game_label_text or "").lower()
-
-    for team_name, boost in BALLPARK_HR_BOOST.items():
-        if team_name.lower() in text:
+    for team_name, boost in boosts.items():
+        if team_name.lower() in lower:
             return boost
 
     return 0
 
 
 def barrel_proxy_score(max_ev, last_hr_ev, near_hr_count):
-    """
-    Lightweight barrel-rate proxy using existing MLB live-feed data.
-    True barrel rate requires Baseball Savant/Statcast data, so this avoids new API risk.
-    """
+    ev = safe_float(last_hr_ev or max_ev, 0)
     score = 0
-    ev_source = last_hr_ev if last_hr_ev else max_ev
 
-    if ev_source:
-        ev = float(ev_source)
+    if ev >= 112:
+        score += 16
+    elif ev >= 109:
+        score += 12
+    elif ev >= 106:
+        score += 8
+    elif ev >= 102:
+        score += 4
 
-        if ev >= 112:
-            score += 10
-        elif ev >= 108:
-            score += 7
-        elif ev >= 104:
-            score += 4
-        elif ev >= 100:
-            score += 2
+    score += min(int(near_hr_count or 0), 5) * 3
 
-    score += min(int(near_hr_count or 0), 4) * 2
     return score
 
 
+def build_today_first_candidates(today_games, hot_streaks, top_pool=50):
+    context = {}
 
-# =========================
-# DATA-DRIVEN STAT-ONLY HR PARLAYS
-# =========================
+    for game in today_games:
+        away = game.get("away") or {}
+        home = game.get("home") or {}
 
-def _parlay_candidate_score(row):
-    score = 0
+        for team, opp in ((away, home), (home, away)):
+            for key in [
+                team.get("abbreviation"),
+                team.get("teamName"),
+                team.get("name"),
+                team.get("fileCode"),
+            ]:
+                if not key:
+                    continue
 
-    # Recent HR production
-    score += int(row.get("last_7_hr", 0) or 0) * 14
-    score += int(row.get("streak_days", 0) or 0) * 7
+                context[str(key).upper()] = {
+                    "team_id": team.get("id"),
+                    "game": game,
+                    "opponent": (
+                        opp.get("abbreviation")
+                        or opp.get("teamName")
+                        or opp.get("name")
+                        or "OPP"
+                    ),
+                    "ballpark_boost": get_ballpark_boost_from_game_label(
+                        game_label(game)
+                    ),
+                }
 
-    # Near-HR contact quality
-    near_hr_count = int(row.get("near_hr_count", 0) or 0)
-    score += near_hr_count * HR_PARLAY_NEAR_HR_WEIGHT
+    pool = list(hot_streaks or [])[:top_pool]
 
-    max_ev = row.get("max_ev")
-    last_hr_ev = row.get("last_hr_ev")
+    player_ids = [
+        row.get("player_id")
+        for row in pool
+        if row.get("player_id")
+    ]
 
-    # Heavier EV weighting
-    if last_hr_ev:
-        score += max(0, float(last_hr_ev) - 95) * HR_PARLAY_EV_WEIGHT
-    elif max_ev:
-        score += max(0, float(max_ev) - 98) * (HR_PARLAY_EV_WEIGHT * 0.75)
+    contact_cache = collect_recent_contact_for_players(
+        player_ids,
+        days=3,
+    )
 
-    # Barrel-rate proxy from EV + near-HR
-    score += barrel_proxy_score(max_ev, last_hr_ev, near_hr_count)
+    pitcher_cache = {}
 
-    # Pitcher HR weakness
-    if row.get("pitcher_hr9"):
-        score += float(row["pitcher_hr9"]) * 10
+    candidates = []
 
-    # Ballpark HR factor
-    score += float(row.get("ballpark_boost", 0) or 0) * HR_PARLAY_BALLPARK_WEIGHT
+    for hot in pool:
+        team_abbr = hot.get("team_abbr", "MLB")
 
-    # Existing 2HR model score
-    if row.get("score"):
-        score += float(row["score"]) * 0.35
+        ctx = context.get(str(team_abbr).upper(), {})
 
-    return round(score, 1)
+        game = ctx.get("game")
 
-def build_stat_only_hr_parlay_picks(hot_streaks, two_hr_watch):
-    """
-    Builds Safe/Risky/Bomb from MLB-only signals.
-    No Odds API needed, so no 429s.
+        contact = contact_cache.get(
+            hot.get("player_id"),
+            {
+                "near_hr_count": 0,
+                "max_ev": None,
+                "last_hr_ev": None,
+            },
+        )
 
-    Signals:
-    - recent HRs
-    - HR streak days
-    - near-HR balls
-    - EV
-    - opposing pitcher HR/9 when available
-    """
-    merged = {}
+        pitcher_name = "TBD"
+        pitcher_hr9 = None
 
-    for row in hot_streaks or []:
-        key = row.get("player_id") or row.get("name")
-        merged[key] = {
-            "name": row.get("name", "Unknown"),
-            "team_abbr": row.get("team_abbr", "MLB"),
-            "last_7_hr": int(row.get("total_hr", 0) or 0),
-            "streak_days": int(row.get("streak_days", 0) or 0),
-            "near_hr_count": 0,
-            "max_ev": None,
-            "last_hr_ev": None,
-            "pitcher_name": "TBD",
-            "pitcher_hr9": None,
-            "ballpark_boost": 0,
-            "barrel_proxy": 0,
-            "base_score": 0,
+        if game and ctx.get("team_id"):
+            probable = get_probable_pitcher_for_team(
+                game,
+                ctx["team_id"],
+            )
+
+            pitcher_id = probable.get("id") if probable else None
+
+            pitcher_name = (
+                probable.get("fullName")
+                if probable
+                else "TBD"
+            )
+
+            if pitcher_id and pitcher_id not in pitcher_cache:
+                pitcher_cache[pitcher_id] = get_pitcher_hr_per_9(
+                    pitcher_id
+                )
+
+            pitcher_hr9 = (
+                pitcher_cache.get(pitcher_id)
+                if pitcher_id
+                else None
+            )
+
+        row = {
+            "player_id": hot.get("player_id"),
+            "name": hot.get("name", "Unknown"),
+            "team_abbr": team_abbr,
+            "opponent": ctx.get("opponent", "OPP"),
+            "game": (
+                game_label(game)
+                if game
+                else "Game TBD"
+            ),
+            "last_7_hr": int(hot.get("total_hr", 0) or 0),
+            "streak_days": int(hot.get("streak_days", 0) or 0),
+            "near_hr_count": int(contact.get("near_hr_count", 0) or 0),
+            "max_ev": contact.get("max_ev"),
+            "last_hr_ev": contact.get("last_hr_ev"),
+            "pitcher_name": pitcher_name,
+            "pitcher_hr9": pitcher_hr9,
+            "ballpark_boost": ctx.get("ballpark_boost", 0),
         }
 
+        row["barrel_proxy"] = barrel_proxy_score(
+            row["max_ev"],
+            row["last_hr_ev"],
+            row["near_hr_count"],
+        )
+
+        best_ev = max(
+            safe_float(row["max_ev"]),
+            safe_float(row["last_hr_ev"]),
+        )
+
+        score = 0
+
+        score += row["near_hr_count"] * 11
+        score += max(0, min((best_ev - 98) * 1.55, 24))
+        score += row["barrel_proxy"]
+
+        if row["pitcher_hr9"] is not None:
+            score += safe_float(row["pitcher_hr9"]) * 13
+
+        score += row["ballpark_boost"] * 1.6
+
+        score += min(row["last_7_hr"] * 4, 14)
+        score += min(row["streak_days"] * 2, 6)
+
+        row["final_score"] = round(
+            max(0, min(score, 100)),
+            1,
+        )
+
+        two_hr_score = score
+
+        two_hr_score += max(
+            0,
+            min((best_ev - 108) * 2, 14),
+        )
+
+        two_hr_score += min(
+            row["near_hr_count"] * 4,
+            16,
+        )
+
+        if (
+            row["pitcher_hr9"] is not None
+            and row["pitcher_hr9"] >= 1.35
+        ):
+            two_hr_score += 8
+
+        if (
+            best_ev < 106
+            or (
+                row["near_hr_count"] == 0
+                and row["last_7_hr"] < 2
+            )
+        ):
+            two_hr_score -= 10
+
+        row["score"] = round(
+            max(0, min(two_hr_score, 100)),
+            1,
+        )
+
+        candidates.append(row)
+
+    candidates.sort(
+        key=lambda x: (
+            -x["final_score"],
+            -x["barrel_proxy"],
+            -x["near_hr_count"],
+            x["name"],
+        )
+    )
+
+    return candidates
+
+
+def build_2hr_watch(
+    today_games,
+    hot_streaks,
+    top_n: int = TWO_HR_WATCH_TOP_N,
+):
+    if not ENABLE_2HR_WATCH:
+        return []
+
+    rows = build_today_first_candidates(
+        today_games,
+        hot_streaks,
+        top_pool=max(top_n * 6, 36),
+    )
+
+    rows = [
+        r
+        for r in rows
+        if r["score"] >= TWO_HR_MIN_SCORE
+    ]
+
+    rows.sort(
+        key=lambda x: (
+            -x["score"],
+            -x["barrel_proxy"],
+            -x["near_hr_count"],
+            x["name"],
+        )
+    )
+
+    for row in rows:
+        row["confidence"] = (
+            "High"
+            if row["score"] >= 72
+            else "Medium"
+            if row["score"] >= 55
+            else "Longshot"
+        )
+
+    return rows[:top_n]
+
+
+def _today_reason_bits(row):
+    bits = []
+
+    if row.get("near_hr_count"):
+        bits.append(f"{row['near_hr_count']} near-HR last 3d")
+
+    if row.get("last_hr_ev"):
+        bits.append(f"{safe_float(row['last_hr_ev']):.1f} EV last HR")
+    elif row.get("max_ev"):
+        bits.append(f"{safe_float(row['max_ev']):.1f} max EV")
+
+    if row.get("pitcher_hr9") is not None:
+        bits.append(f"faces {row.get('pitcher_name', 'SP')} {row['pitcher_hr9']} HR/9")
+
+    if row.get("ballpark_boost"):
+        bits.append(f"park {row['ballpark_boost']:+}")
+
+    if row.get("barrel_proxy"):
+        bits.append(f"barrel proxy +{row['barrel_proxy']}")
+
+    if row.get("last_7_hr"):
+        bits.append(f"{row['last_7_hr']} HR last {HOT_STREAK_DAYS}d")
+
+    return bits or ["today-first matchup edge"]
+
+
+async def send_2hr_watch_embed(channel, two_hr_watch):
+    if not ENABLE_2HR_WATCH:
+        return
+
+    if not two_hr_watch:
+        await safe_discord_send(
+            channel,
+            "💥 **2-HR Watch**\nNo qualifying 2-HR spots from today's matchup/contact data."
+        )
+        return
+
+    embed = discord.Embed(
+        title="💥 2-HR Watch",
+        description="Today-first model: EV, near-HR contact, barrel proxy, park boost, and opposing pitcher HR/9.",
+        color=discord.Color.red(),
+    )
+
+    for idx, row in enumerate(two_hr_watch, start=1):
+        lines = _today_reason_bits(row)
+        lines.append(f"2HR Score: {row['score']}")
+        lines.append(f"Confidence: {row['confidence']}")
+
+        embed.add_field(
+            name=f"{idx}. {row['name']} ({row['team_abbr']})",
+            value="\n".join(f"• {x}" for x in lines[:7]),
+            inline=False,
+        )
+
+    await safe_discord_send(channel, embed=embed)
+
+
+def build_stat_only_hr_parlay_picks(hot_streaks, two_hr_watch):
+    candidates = build_today_first_candidates(
+        get_today_games(),
+        hot_streaks,
+        top_pool=50,
+    )
+
+    by_name = {
+        row["name"].lower(): row
+        for row in candidates
+    }
+
     for row in two_hr_watch or []:
-        key = row.get("name")
-        existing = merged.setdefault(key, {
-            "name": row.get("name", "Unknown"),
-            "team_abbr": row.get("team_abbr", "MLB"),
-            "last_7_hr": int(row.get("last_7_hr", 0) or 0),
-            "streak_days": int(row.get("streak_days", 0) or 0),
-            "near_hr_count": 0,
-            "max_ev": None,
-            "last_hr_ev": None,
-            "pitcher_name": "TBD",
-            "pitcher_hr9": None,
-            "ballpark_boost": 0,
-            "barrel_proxy": 0,
-            "base_score": 0,
-        })
+        key = row["name"].lower()
+        by_name[key] = {
+            **by_name.get(key, {}),
+            **row,
+        }
 
-        existing["team_abbr"] = row.get("team_abbr") or existing.get("team_abbr", "MLB")
-        existing["last_7_hr"] = max(existing.get("last_7_hr", 0), int(row.get("last_7_hr", 0) or 0))
-        existing["near_hr_count"] = max(existing.get("near_hr_count", 0), int(row.get("near_hr_count", 0) or 0))
-        existing["max_ev"] = row.get("max_ev") or existing.get("max_ev")
-        existing["last_hr_ev"] = row.get("last_hr_ev") or existing.get("last_hr_ev")
-        existing["pitcher_name"] = row.get("pitcher_name") or existing.get("pitcher_name", "TBD")
-        existing["pitcher_hr9"] = row.get("pitcher_hr9") if row.get("pitcher_hr9") is not None else existing.get("pitcher_hr9")
-        existing["game"] = row.get("game") or existing.get("game", "Game match TBD")
-        existing["ballpark_boost"] = row.get("ballpark_boost", existing.get("ballpark_boost", 0))
-        existing["score"] = max(float(existing.get("score", 0) or 0), float(row.get("score", 0) or 0))
+    candidates = list(by_name.values())
 
-    candidates = list(merged.values())
+    candidates.sort(
+        key=lambda x: (
+            -x.get("final_score", 0),
+            -x.get("barrel_proxy", 0),
+            -x.get("near_hr_count", 0),
+            x.get("name", ""),
+        )
+    )
 
-    for c in candidates:
-        if not c.get("ballpark_boost"):
-            c["ballpark_boost"] = get_ballpark_boost_from_game_label(c.get("game"))
-        c["barrel_proxy"] = barrel_proxy_score(c.get("max_ev"), c.get("last_hr_ev"), c.get("near_hr_count"))
-        c["final_score"] = _parlay_candidate_score(c)
-
-    candidates = [c for c in candidates if c["last_7_hr"] > 0 or c["near_hr_count"] > 0 or c["final_score"] >= 25]
-    candidates.sort(key=lambda x: (-x["final_score"], -x["last_7_hr"], -x["near_hr_count"], x["name"]))
-
-    used_players = set()
-
-    def pick(pool, max_legs):
+    def pick(pool, legs):
         picks = []
         used_teams = set()
-        for c in pool:
-            pkey = c["name"].lower()
-            team = c.get("team_abbr", "MLB")
-            if pkey in used_players:
-                continue
+
+        for row in pool:
+            team = row.get("team_abbr")
+
             if team in used_teams:
                 continue
-            picks.append(c)
-            used_players.add(pkey)
+
+            picks.append(row)
             used_teams.add(team)
-            if len(picks) >= max_legs:
+
+            if len(picks) >= legs:
                 break
+
         return picks
 
-    safe_pool = [c for c in candidates if c["final_score"] >= 45]
-    risky_pool = [c for c in candidates if c["final_score"] >= 30]
-    bomb_pool = candidates[:]
+    safe_pool = [
+        c for c in candidates
+        if c["final_score"] >= 62
+    ]
 
-    safe = pick(safe_pool or candidates, max(2, min(4, MORNING_PARLAY_LEGS_SAFE)))
-    risky = pick(risky_pool or candidates, max(2, min(4, MORNING_PARLAY_LEGS_RISKY)))
-    bomb = pick(bomb_pool, max(2, min(4, MORNING_PARLAY_LEGS_BOMB)))
+    risky_pool = [
+        c for c in candidates
+        if c["final_score"] >= 48
+    ]
 
-    return {"safe": safe, "risky": risky, "bomb": bomb}
+    bomb_pool = [
+        c for c in candidates
+        if c["final_score"] >= 32
+    ]
+
+    return {
+        "safe": pick(
+            safe_pool or candidates,
+            max(2, min(4, MORNING_PARLAY_LEGS_SAFE)),
+        ),
+        "risky": pick(
+            risky_pool or candidates,
+            max(2, min(4, MORNING_PARLAY_LEGS_RISKY)),
+        ),
+        "bomb": pick(
+            bomb_pool or candidates,
+            max(2, min(4, MORNING_PARLAY_LEGS_BOMB)),
+        ),
+    }
 
 
 def _format_stat_parlay_rows(rows):
@@ -1935,62 +1917,54 @@ def _format_stat_parlay_rows(rows):
         return "Not enough strong candidates today."
 
     lines = []
-    for row in rows:
-        details = []
-        if row.get("last_7_hr"):
-            details.append(f"{row['last_7_hr']} HR last {HOT_STREAK_DAYS}d")
-        if row.get("streak_days"):
-            details.append(f"{row['streak_days']}d streak")
-        if row.get("near_hr_count"):
-            details.append(f"{row['near_hr_count']} near-HR last 3g")
-        if row.get("last_hr_ev"):
-            details.append(f"{float(row['last_hr_ev']):.1f} EV last HR")
-        elif row.get("max_ev"):
-            details.append(f"{float(row['max_ev']):.1f} max EV")
-        if row.get("pitcher_hr9") is not None:
-            details.append(f"opp SP {row['pitcher_hr9']} HR/9")
-        if row.get("ballpark_boost"):
-            boost = row["ballpark_boost"]
-            details.append(f"park {'+' if boost > 0 else ''}{boost}")
-        if row.get("barrel_proxy"):
-            details.append(f"barrel proxy +{row['barrel_proxy']}")
 
-        detail_text = " | ".join(details) if details else "MLB signal score"
-        lines.append(f"• **{row['name']} ({row.get('team_abbr', 'MLB')})** — Score {row['final_score']}\n  {detail_text}")
+    for row in rows:
+        lines.append(
+            f"• **{row['name']} ({row.get('team_abbr', 'MLB')})** — "
+            f"Score {row.get('final_score', row.get('score', 0))}\n  "
+            + " | ".join(_today_reason_bits(row)[:5])
+        )
 
     return "\n".join(lines)
 
 
-
 async def send_hr_matchup_dashboard(channel, parlays):
-    combined = (parlays.get("safe", []) + parlays.get("risky", []) + parlays.get("bomb", []))[:8]
+    combined = (
+        parlays.get("safe", [])
+        + parlays.get("risky", [])
+        + parlays.get("bomb", [])
+    )
 
-    if not combined:
+    seen = set()
+    rows = []
+
+    for row in sorted(
+        combined,
+        key=lambda x: x.get("final_score", 0),
+        reverse=True,
+    ):
+        if row["name"] in seen:
+            continue
+
+        seen.add(row["name"])
+        rows.append(row)
+
+        if len(rows) >= 8:
+            break
+
+    if not rows:
         return
 
     embed = discord.Embed(
         title="💣 HR Matchup Dashboard",
-        description="Top HR environments for today's slate",
+        description="Top HR environments from today's slate",
         color=discord.Color.red(),
     )
 
-    for row in combined:
-        details = []
-
-        if row.get("last_7_hr"):
-            details.append(f"{row['last_7_hr']} HR last {HOT_STREAK_DAYS}d")
-        if row.get("near_hr_count"):
-            details.append(f"{row['near_hr_count']} near-HR")
-        if row.get("max_ev"):
-            details.append(f"{float(row['max_ev']):.1f} max EV")
-        if row.get("ballpark_boost"):
-            details.append(f"park {row['ballpark_boost']:+}")
-        if row.get("pitcher_hr9") is not None:
-            details.append(f"opp SP {row['pitcher_hr9']} HR/9")
-
+    for row in rows:
         embed.add_field(
-            name=f"{row['name']} ({row.get('team_abbr', 'MLB')}) — Score {row.get('final_score', 0)}",
-            value=" | ".join(details) if details else "Model signal",
+            name=f"{row['name']} ({row.get('team_abbr', 'MLB')}) — {row.get('final_score', 0)}",
+            value=" | ".join(_today_reason_bits(row)[:6]),
             inline=False,
         )
 
@@ -1998,65 +1972,102 @@ async def send_hr_matchup_dashboard(channel, parlays):
 
 
 async def send_barrel_zone_dashboard(channel, parlays):
-    candidates = sorted(
-        parlays.get("safe", []) + parlays.get("risky", []) + parlays.get("bomb", []),
-        key=lambda x: (x.get("barrel_proxy", 0), x.get("final_score", 0)),
-        reverse=True,
-    )[:6]
+    combined = (
+        parlays.get("safe", [])
+        + parlays.get("risky", [])
+        + parlays.get("bomb", [])
+    )
 
-    if not candidates:
+    seen = set()
+    rows = []
+
+    for row in sorted(
+        combined,
+        key=lambda x: (
+            x.get("barrel_proxy", 0),
+            x.get("final_score", 0),
+        ),
+        reverse=True,
+    ):
+        if row["name"] in seen:
+            continue
+
+        seen.add(row["name"])
+        rows.append(row)
+
+        if len(rows) >= 6:
+            break
+
+    if not rows:
         return
 
     embed = discord.Embed(
         title="🎯 Barrel Zone Matchups",
-        description="Power profiles with EV / near-HR / barrel-proxy signals",
+        description="EV + near-HR barrel proxy against today's matchup",
         color=discord.Color.gold(),
     )
 
-    for row in candidates:
-        details = []
-
-        if row.get("barrel_proxy"):
-            details.append(f"barrel proxy +{row['barrel_proxy']}")
-        if row.get("last_hr_ev"):
-            details.append(f"{float(row['last_hr_ev']):.1f} EV last HR")
-        elif row.get("max_ev"):
-            details.append(f"{float(row['max_ev']):.1f} max EV")
-        if row.get("near_hr_count"):
-            details.append(f"{row['near_hr_count']} near-HR")
-        if row.get("ballpark_boost"):
-            details.append(f"park {row['ballpark_boost']:+}")
-
+    for row in rows:
         embed.add_field(
             name=f"{row['name']} ({row.get('team_abbr', 'MLB')})",
-            value=" | ".join(details) if details else "Barrel-zone profile",
+            value=" | ".join(_today_reason_bits(row)[:6]),
             inline=False,
         )
 
     await safe_discord_send(channel, embed=embed)
 
 
-
-async def send_morning_hr_parlays_embed(channel, hot_streaks, two_hr_watch, today_games):
+async def send_morning_hr_parlays_embed(
+    channel,
+    hot_streaks,
+    two_hr_watch,
+    today_games,
+):
     if not ENABLE_MORNING_HR_PARLAYS:
         return
 
-    parlays = build_stat_only_hr_parlay_picks(hot_streaks, two_hr_watch)
+    parlays = build_stat_only_hr_parlay_picks(
+        hot_streaks,
+        two_hr_watch,
+    )
 
     if not any(parlays.values()):
-        await safe_discord_send(channel, "💣 **Best HR Parlays Today**\nNo strong MLB stat-based HR parlay candidates found today.")
+        await safe_discord_send(
+            channel,
+            "💣 **Best HR Parlays Today**\nNo strong today-first HR candidates found."
+        )
         return
 
     embed = discord.Embed(
         title="💣 Best HR Parlays Today",
-        description="Stat-only picks using MLB form, heavier EV weighting, near-HR contact, ballpark boost, barrel proxy, and pitcher matchup. No Odds API needed.",
+        description=(
+            "Today-first picks using EV, near-HR contact, barrel proxy, "
+            "park boost and opposing pitcher HR/9. Recent HRs are capped."
+        ),
         color=discord.Color.blue(),
     )
 
-    embed.add_field(name=f"🟢 Safe — {len(parlays['safe'])} Legs", value=_format_stat_parlay_rows(parlays["safe"]), inline=False)
-    embed.add_field(name=f"🟡 Risky — {len(parlays['risky'])} Legs", value=_format_stat_parlay_rows(parlays["risky"]), inline=False)
-    embed.add_field(name=f"🔴 Bomb — {len(parlays['bomb'])} Legs", value=_format_stat_parlay_rows(parlays["bomb"]), inline=False)
-    embed.set_footer(text="Stat model only. Add legs manually in your sportsbook. Bet responsibly.")
+    embed.add_field(
+        name=f"🟢 Safe — {len(parlays['safe'])} Legs",
+        value=_format_stat_parlay_rows(parlays["safe"]),
+        inline=False,
+    )
+
+    embed.add_field(
+        name=f"🟡 Risky — {len(parlays['risky'])} Legs",
+        value=_format_stat_parlay_rows(parlays["risky"]),
+        inline=False,
+    )
+
+    embed.add_field(
+        name=f"🔴 Bomb — {len(parlays['bomb'])} Legs",
+        value=_format_stat_parlay_rows(parlays["bomb"]),
+        inline=False,
+    )
+
+    embed.set_footer(
+        text="Stat model only. Add legs manually in your sportsbook. Bet responsibly."
+    )
 
     await safe_discord_send(channel, embed=embed)
 
@@ -2064,12 +2075,6 @@ async def send_morning_hr_parlays_embed(channel, hot_streaks, two_hr_watch, toda
     await send_barrel_zone_dashboard(channel, parlays)
 
 
-
-async def safe_send_report_section(section_name, coro):
-    try:
-        await coro
-    except Exception as exc:
-        log.exception("Report section failed: %s: %s", section_name, exc)
 
 async def post_daily_hr_recap(force=False):
     target_date = yesterday_str()
