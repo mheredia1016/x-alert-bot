@@ -1548,6 +1548,15 @@ def barrel_proxy_score(max_ev, last_hr_ev, near_hr_count):
 
 
 def build_today_first_candidates(today_games, hot_streaks, top_pool=50):
+    """
+    Today-first candidate pool.
+
+    Important change:
+    This no longer only uses recent HR hitters. It starts with today's active
+    rosters, then merges in hot-streak HR data. That means players who did NOT
+    homer yesterday/recently can still show up if their contact + matchup data
+    is strong enough.
+    """
     context = {}
 
     for game in today_games:
@@ -1566,6 +1575,7 @@ def build_today_first_candidates(today_games, hot_streaks, top_pool=50):
 
                 context[str(key).upper()] = {
                     "team_id": team.get("id"),
+                    "team_abbr": team.get("abbreviation") or team.get("teamName") or team.get("name") or "MLB",
                     "game": game,
                     "opponent": (
                         opp.get("abbreviation")
@@ -1573,12 +1583,61 @@ def build_today_first_candidates(today_games, hot_streaks, top_pool=50):
                         or opp.get("name")
                         or "OPP"
                     ),
-                    "ballpark_boost": get_ballpark_boost_from_game_label(
-                        game_label(game)
-                    ),
+                    "ballpark_boost": get_ballpark_boost_from_game_label(game_label(game)),
                 }
 
-    pool = list(hot_streaks or [])[:top_pool]
+    # Build player pool from TODAY'S active rosters first.
+    pool_by_id = {}
+
+    for ctx in context.values():
+        team_id = ctx.get("team_id")
+        team_abbr = ctx.get("team_abbr", "MLB")
+
+        if not team_id:
+            continue
+
+        try:
+            roster_players = active_roster_players_for_team(team_id, team_abbr)
+        except Exception as exc:
+            log.warning("Could not load today's roster for %s: %s", team_abbr, exc)
+            roster_players = []
+
+        for player in roster_players:
+            player_id = player.get("player_id")
+            if not player_id:
+                continue
+
+            pool_by_id[player_id] = {
+                "player_id": player_id,
+                "name": player.get("name", "Unknown"),
+                "team_abbr": team_abbr,
+                "total_hr": 0,
+                "streak_days": 0,
+            }
+
+    # Merge in hot-streak data as a SMALL scoring factor, not the whole pool.
+    for hot in hot_streaks or []:
+        player_id = hot.get("player_id")
+        if not player_id:
+            continue
+
+        existing = pool_by_id.setdefault(
+            player_id,
+            {
+                "player_id": player_id,
+                "name": hot.get("name", "Unknown"),
+                "team_abbr": hot.get("team_abbr", "MLB"),
+                "total_hr": 0,
+                "streak_days": 0,
+            },
+        )
+
+        existing["name"] = hot.get("name", existing.get("name", "Unknown"))
+        existing["team_abbr"] = hot.get("team_abbr", existing.get("team_abbr", "MLB"))
+        existing["total_hr"] = int(hot.get("total_hr", 0) or 0)
+        existing["streak_days"] = int(hot.get("streak_days", 0) or 0)
+
+    pool = list(pool_by_id.values())
 
     player_ids = [
         row.get("player_id")
@@ -1586,20 +1645,13 @@ def build_today_first_candidates(today_games, hot_streaks, top_pool=50):
         if row.get("player_id")
     ]
 
-    contact_cache = collect_recent_contact_for_players(
-        player_ids,
-        days=3,
-    )
-
+    contact_cache = collect_recent_contact_for_players(player_ids, days=3)
     pitcher_cache = {}
-
     candidates = []
 
     for hot in pool:
         team_abbr = hot.get("team_abbr", "MLB")
-
         ctx = context.get(str(team_abbr).upper(), {})
-
         game = ctx.get("game")
 
         contact = contact_cache.get(
@@ -1615,40 +1667,21 @@ def build_today_first_candidates(today_games, hot_streaks, top_pool=50):
         pitcher_hr9 = None
 
         if game and ctx.get("team_id"):
-            probable = get_probable_pitcher_for_team(
-                game,
-                ctx["team_id"],
-            )
-
+            probable = get_probable_pitcher_for_team(game, ctx["team_id"])
             pitcher_id = probable.get("id") if probable else None
-
-            pitcher_name = (
-                probable.get("fullName")
-                if probable
-                else "TBD"
-            )
+            pitcher_name = probable.get("fullName") if probable else "TBD"
 
             if pitcher_id and pitcher_id not in pitcher_cache:
-                pitcher_cache[pitcher_id] = get_pitcher_hr_per_9(
-                    pitcher_id
-                )
+                pitcher_cache[pitcher_id] = get_pitcher_hr_per_9(pitcher_id)
 
-            pitcher_hr9 = (
-                pitcher_cache.get(pitcher_id)
-                if pitcher_id
-                else None
-            )
+            pitcher_hr9 = pitcher_cache.get(pitcher_id) if pitcher_id else None
 
         row = {
             "player_id": hot.get("player_id"),
             "name": hot.get("name", "Unknown"),
             "team_abbr": team_abbr,
             "opponent": ctx.get("opponent", "OPP"),
-            "game": (
-                game_label(game)
-                if game
-                else "Game TBD"
-            ),
+            "game": game_label(game) if game else "Game TBD",
             "last_7_hr": int(hot.get("total_hr", 0) or 0),
             "streak_days": int(hot.get("streak_days", 0) or 0),
             "near_hr_count": int(contact.get("near_hr_count", 0) or 0),
@@ -1672,56 +1705,44 @@ def build_today_first_candidates(today_games, hot_streaks, top_pool=50):
 
         score = 0
 
+        # TODAY/recent contact quality is the main signal.
         score += row["near_hr_count"] * 11
         score += max(0, min((best_ev - 98) * 1.55, 24))
         score += row["barrel_proxy"]
 
+        # Today's opposing pitcher + today's park.
         if row["pitcher_hr9"] is not None:
             score += safe_float(row["pitcher_hr9"]) * 13
 
         score += row["ballpark_boost"] * 1.6
 
+        # Recent HR form is capped and cannot dominate.
         score += min(row["last_7_hr"] * 4, 14)
         score += min(row["streak_days"] * 2, 6)
 
-        row["final_score"] = round(
-            max(0, min(score, 100)),
-            1,
-        )
+        row["final_score"] = round(max(0, min(score, 100)), 1)
 
         two_hr_score = score
+        two_hr_score += max(0, min((best_ev - 108) * 2, 14))
+        two_hr_score += min(row["near_hr_count"] * 4, 16)
 
-        two_hr_score += max(
-            0,
-            min((best_ev - 108) * 2, 14),
-        )
-
-        two_hr_score += min(
-            row["near_hr_count"] * 4,
-            16,
-        )
-
-        if (
-            row["pitcher_hr9"] is not None
-            and row["pitcher_hr9"] >= 1.35
-        ):
+        if row["pitcher_hr9"] is not None and row["pitcher_hr9"] >= 1.35:
             two_hr_score += 8
 
-        if (
-            best_ev < 106
-            or (
-                row["near_hr_count"] == 0
-                and row["last_7_hr"] < 2
-            )
-        ):
+        if best_ev < 106 or (row["near_hr_count"] == 0 and row["last_7_hr"] < 2):
             two_hr_score -= 10
 
-        row["score"] = round(
-            max(0, min(two_hr_score, 100)),
-            1,
-        )
+        row["score"] = round(max(0, min(two_hr_score, 100)), 1)
 
-        candidates.append(row)
+        # Keep only players with at least one useful signal.
+        if (
+            row["near_hr_count"] > 0
+            or row["barrel_proxy"] >= 4
+            or row["pitcher_hr9"] is not None
+            or row["ballpark_boost"]
+            or row["last_7_hr"] > 0
+        ):
+            candidates.append(row)
 
     candidates.sort(
         key=lambda x: (
@@ -1732,8 +1753,7 @@ def build_today_first_candidates(today_games, hot_streaks, top_pool=50):
         )
     )
 
-    return candidates
-
+    return candidates[:top_pool]
 
 def build_2hr_watch(
     today_games,
@@ -2307,7 +2327,7 @@ async def on_message(message):
 
 
     elif content == "!hrparlays":
-        await safe_discord_send(message.channel, "Building today’s best HR parlays... using cached odds when available.")
+        await safe_discord_send(message.channel, "Building today’s best HR parlays... using today-first matchup/contact data.")
         try:
             hot_streaks = await asyncio.to_thread(build_hot_streaks)
             today_games = await asyncio.to_thread(get_today_games)
