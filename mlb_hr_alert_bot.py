@@ -2095,7 +2095,24 @@ async def send_morning_hr_parlays_embed(
     await send_barrel_zone_dashboard(channel, parlays)
 
 
+def split_lines_into_chunks(header, lines, max_chars=1900):
+    chunks = []
+    current = header.strip()
 
+    for line in lines:
+        line = str(line)
+
+        if len(current) + len(line) + 1 > max_chars:
+            chunks.append(current)
+            current = ""
+
+        current += ("\n" if current else "") + line
+
+    if current.strip():
+        chunks.append(current)
+
+    return chunks
+    
 async def post_daily_hr_recap(force=False):
     target_date = yesterday_str()
 
