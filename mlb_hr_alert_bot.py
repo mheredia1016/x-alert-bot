@@ -871,6 +871,51 @@ async def maybe_send_pitcher_weakspot_alert(channel, game, play, metrics):
     except Exception:
         return
 
+    result = play.get("result", {}) or {}
+    event_type = (result.get("eventType") or "").lower().strip()
+    event_text = " ".join([
+        str(result.get("event") or ""),
+        str(result.get("description") or ""),
+        event_type,
+    ]).lower()
+
+    # Do not count foul balls / foul tips as pitcher damage.
+    if "foul" in event_text:
+        return
+
+    # Only count completed batted-ball outcomes or actual HRs.
+    # This prevents random foul/K pitch hitData from polluting the alert.
+    batted_ball_events = {
+        "single", "double", "triple", "home_run",
+        "field_out", "force_out", "grounded_into_double_play",
+        "double_play", "fielders_choice", "fielders_choice_out",
+        "sac_fly", "sac_bunt", "lineout", "flyout", "groundout",
+        "pop_out", "field_error",
+    }
+    if event_type and event_type not in batted_ball_events and not is_home_run(play):
+        return
+
+    launch_angle = metrics.get("launchAngle")
+    try:
+        launch_angle = float(launch_angle)
+    except Exception:
+        return
+
+    # More direct HR shape: avoid grounders and sky-high popups.
+    if launch_angle < 10 or launch_angle > 38:
+        return
+
+    distance = metrics.get("totalDistance")
+    try:
+        distance = float(distance or 0)
+    except Exception:
+        distance = 0
+
+    # Ignore short contact. This keeps weakspot alerts focused on real damage.
+    if distance < 280:
+        return
+
+    # Require dangerous contact.
     if ev < 95:
         return
 
@@ -889,19 +934,28 @@ async def maybe_send_pitcher_weakspot_alert(channel, game, play, metrics):
             "hardest_ev": 0.0,
             "targets": set(),
             "target_keys": {},
+            "target_evs": {},
         },
     )
+    pdata.setdefault("targets", set())
+    pdata.setdefault("target_keys", {})
+    pdata.setdefault("target_evs", {})
+
     pdata["count"] += 1
 
-    if ev >= 100:
+    if ev >= 100 and 15 <= launch_angle <= 32:
         pdata["elite_count"] += 1
 
     pdata["hardest_ev"] = max(float(pdata["hardest_ev"]), ev)
     batter_name = batter.get("fullName", "Unknown")
     batter_key = player_game_key(game, play)
-    pdata["targets"].add(batter_name)
-    pdata.setdefault("target_keys", {})
-    pdata["target_keys"][batter_name] = batter_key
+
+    # Count the pitcher damage, but do not recommend the hitter from this play if he just homered.
+    if not is_home_run(play):
+        pdata["targets"].add(batter_name)
+        pdata["target_keys"][batter_name] = batter_key
+        pdata["target_evs"][batter_name] = max(float(pdata["target_evs"].get(batter_name, 0.0)), ev)
+
     pitcher_hard_hit_tracker[key] = pdata
 
     state.setdefault("seen_pitcher_weakspot_alerts", [])
@@ -909,43 +963,55 @@ async def maybe_send_pitcher_weakspot_alert(channel, game, play, metrics):
     if key in state["seen_pitcher_weakspot_alerts"]:
         return
 
-    # Tightened Pitcher Weakspot trigger
-    # Only alert when a pitcher is consistently getting crushed.
-    if pdata["count"] < 5:
+    # Tightened Pitcher Weakspot trigger: HR-shaped damage only.
+    if pdata["count"] < 4:
         return
 
-    if pdata.get("elite_count", 0) < 3:
+    if pdata.get("elite_count", 0) < 2:
+        return
+
+    if pdata.get("hardest_ev", 0) < 103:
+        return
+
+    if len(pdata.get("targets", [])) < 2:
         return
 
     lines = [
-        "🚨 **Pitcher Weakspot**",
+        "🚨 **Pitcher Damage Watch**",
         "",
-        f"**{pitcher_name}** is getting squared up repeatedly",
-        f"Hard-hit balls allowed: {pdata['count']}",
-        f"100+ EV balls allowed: {pdata.get('elite_count', 0)}",
+        f"**{pitcher_name}** is allowing HR-shaped contact",
+        f"Danger balls allowed: {pdata['count']}",
+        f"100+ EV / ideal-angle balls: {pdata.get('elite_count', 0)}",
         f"Hardest EV: {pdata['hardest_ev']:.1f} mph",
+        "Filter: no foul balls, no grounders, no short contact",
         "",
-        "Potential HR targets:",
+        "Best HR targets:",
     ]
 
     state.setdefault("seen_hr_alerts", [])
 
     eligible_targets = []
     target_keys = pdata.get("target_keys", {})
+    target_evs = pdata.get("target_evs", {})
 
     for hitter in list(pdata["targets"]):
         hitter_key = target_keys.get(hitter)
         if hitter_key and hitter_key in state["seen_hr_alerts"]:
             continue
-        eligible_targets.append(hitter)
+        eligible_targets.append((hitter, float(target_evs.get(hitter, 0.0))))
+
+    eligible_targets.sort(key=lambda row: (-row[1], row[0]))
 
     if not eligible_targets:
         return
 
-    for hitter in eligible_targets[:3]:
-        lines.append(f"• {hitter}")
+    for hitter, hitter_ev in eligible_targets[:3]:
+        if hitter_ev > 0:
+            lines.append(f"• {hitter} — {hitter_ev:.1f} EV")
+        else:
+            lines.append(f"• {hitter}")
 
-    target_channel = await get_optional_alert_channel(channel, DISCORD_PITCHER_WEAKSPOT_CHANNEL_ID, "pitcher weakspot")
+    target_channel = await get_optional_alert_channel(channel, DISCORD_PITCHER_WEAKSPOT_CHANNEL_ID, "pitcher damage watch")
     await safe_discord_send(target_channel, "\n".join(lines))
 
     state["seen_pitcher_weakspot_alerts"].append(key)
@@ -1857,7 +1923,7 @@ def build_stat_only_hr_parlay_picks(hot_streaks, two_hr_watch):
     candidates = build_today_first_candidates(
         get_today_games(),
         hot_streaks,
-        top_pool=50,
+        top_pool=75,
     )
 
     by_name = {
@@ -1883,54 +1949,82 @@ def build_stat_only_hr_parlay_picks(hot_streaks, two_hr_watch):
         )
     )
 
-    def pick(pool, legs):
+    def player_key(row):
+        return str(row.get("player_id") or row.get("name", "")).lower()
+
+    def pick(pool, legs, used_players=None, allow_team_dupes=False):
         picks = []
         used_teams = set()
+        used_players = used_players or set()
 
         for row in pool:
+            key = player_key(row)
             team = row.get("team_abbr")
 
-            if team in used_teams:
+            # Keep the three parlay sections from recycling the same player.
+            if key in used_players:
+                continue
+
+            # Default: one hitter per MLB team inside the same parlay.
+            if not allow_team_dupes and team in used_teams:
                 continue
 
             picks.append(row)
             used_teams.add(team)
+            used_players.add(key)
 
             if len(picks) >= legs:
                 break
 
         return picks
 
+    safe_legs = max(2, min(4, MORNING_PARLAY_LEGS_SAFE))
+    risky_legs = max(2, min(4, MORNING_PARLAY_LEGS_RISKY))
+    bomb_legs = max(2, min(4, MORNING_PARLAY_LEGS_BOMB))
+
     safe_pool = [
         c for c in candidates
-        if c["final_score"] >= 62
+        if c.get("final_score", 0) >= 62
     ]
 
+    # Risky excludes the safer tier by score, so it finds different names.
     risky_pool = [
         c for c in candidates
-        if c["final_score"] >= 48
+        if 48 <= c.get("final_score", 0) < 62
     ]
 
+    # Bomb excludes Safe/Risky score ranges and pulls deeper longshots.
     bomb_pool = [
         c for c in candidates
-        if c["final_score"] >= 32
+        if 32 <= c.get("final_score", 0) < 48
     ]
 
-    return {
-        "safe": pick(
-            safe_pool or candidates,
-            max(2, min(4, MORNING_PARLAY_LEGS_SAFE)),
-        ),
-        "risky": pick(
-            risky_pool or candidates,
-            max(2, min(4, MORNING_PARLAY_LEGS_RISKY)),
-        ),
-        "bomb": pick(
-            bomb_pool or candidates,
-            max(2, min(4, MORNING_PARLAY_LEGS_BOMB)),
-        ),
-    }
+    used_players = set()
 
+    safe_picks = pick(safe_pool or candidates, safe_legs, used_players)
+
+    risky_picks = pick(risky_pool, risky_legs, used_players)
+    if len(risky_picks) < risky_legs:
+        risky_picks += pick(
+            candidates,
+            risky_legs - len(risky_picks),
+            used_players,
+        )
+
+    bomb_picks = pick(bomb_pool, bomb_legs, used_players)
+    if len(bomb_picks) < bomb_legs:
+        bomb_picks += pick(
+            list(reversed(candidates)),
+            bomb_legs - len(bomb_picks),
+            used_players,
+            allow_team_dupes=True,
+        )
+
+    return {
+        "safe": safe_picks,
+        "risky": risky_picks,
+        "bomb": bomb_picks,
+    }
 
 def _format_stat_parlay_rows(rows):
     if not rows:
