@@ -2095,24 +2095,83 @@ async def send_morning_hr_parlays_embed(
     await send_barrel_zone_dashboard(channel, parlays)
 
 
+
+
+
+# =========================
+# REPORT SEND HELPERS
+# =========================
+
 def split_lines_into_chunks(header, lines, max_chars=1900):
+    """Split long text reports into Discord-safe message chunks."""
     chunks = []
-    current = header.strip()
+    current = (header or "").strip()
 
-    for line in lines:
+    for line in lines or []:
         line = str(line)
-
-        if len(current) + len(line) + 1 > max_chars:
+        extra = len(line) + (1 if current else 0)
+        if current and len(current) + extra > max_chars:
             chunks.append(current)
             current = ""
-
         current += ("\n" if current else "") + line
 
     if current.strip():
         chunks.append(current)
 
     return chunks
-    
+
+
+async def safe_send_report_section(section_name, coro):
+    """Prevent one optional report section from crashing the entire !yhr report."""
+    try:
+        return await coro
+    except Exception as exc:
+        log.exception("Daily report section %s failed: %s", section_name, exc)
+        return None
+
+
+async def send_hot_streaks_embed(channel, hot_streaks):
+    """Send top recent HR hitters section used by the daily recap."""
+    if not hot_streaks:
+        await safe_discord_send(channel, f"🔥 **Hot HR Streaks — Last {HOT_STREAK_DAYS} Days**\nNo hot streaks found.")
+        return
+
+    lines = [f"🔥 **Hot HR Streaks — Last {HOT_STREAK_DAYS} Days**", ""]
+    for row in hot_streaks[:HOT_STREAK_TOP_N]:
+        streak = row.get("streak_days", 0)
+        streak_text = f" | {streak} game streak" if streak else ""
+        lines.append(f"• **{row.get('name', 'Unknown')} ({row.get('team_abbr', 'MLB')})** — {row.get('total_hr', 0)} HR{streak_text}")
+
+    for chunk in split_lines_into_chunks("", lines):
+        await safe_discord_send(channel, chunk)
+
+
+async def send_birthday_embed(channel, birthday_narratives):
+    """Send birthday narrative section used by !yhr and !bday."""
+    if not ENABLE_BIRTHDAY_NARRATIVE:
+        return
+
+    if not birthday_narratives:
+        await safe_discord_send(channel, "🎂 **Birthday HR Narrative**\nNo MLB birthday bats found for today's active rosters.")
+        return
+
+    lines = ["🎂 **Birthday HR Narrative**", ""]
+    for row in birthday_narratives[:10]:
+        age = row.get("age")
+        age_text = f" turns {age}" if age else "has a birthday"
+        extra = []
+        if row.get("last_7_hr"):
+            extra.append(f"{row['last_7_hr']} HR last {HOT_STREAK_DAYS}d")
+        if row.get("streak_days"):
+            extra.append(f"{row['streak_days']} game HR streak")
+        reason = f" — {'; '.join(extra)}" if extra else ""
+        lines.append(f"• **{row.get('name', 'Unknown')} ({row.get('team_abbr', 'MLB')})**{age_text}{reason}")
+        lines.append(f"  {row.get('game', 'Game TBD')}")
+
+    for chunk in split_lines_into_chunks("", lines):
+        await safe_discord_send(channel, chunk)
+
+
 async def post_daily_hr_recap(force=False):
     target_date = yesterday_str()
 
