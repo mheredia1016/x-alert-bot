@@ -42,6 +42,7 @@ ENABLE_BIRTHDAY_NARRATIVE = os.getenv("ENABLE_BIRTHDAY_NARRATIVE", "true").lower
 ENABLE_NO_HR_THROUGH_3_ALERT = os.getenv("ENABLE_NO_HR_THROUGH_3_ALERT", "true").lower() == "true"
 ENABLE_HARD_HIT_TRACKER = os.getenv("ENABLE_HARD_HIT_TRACKER", "true").lower() == "true"
 ENABLE_PITCHER_WEAKSPOT_ALERTS = os.getenv("ENABLE_PITCHER_WEAKSPOT_ALERTS", "true").lower() == "true"
+ENABLE_BVP_HR_HISTORY = os.getenv("ENABLE_BVP_HR_HISTORY", "true").lower() == "true"
 HARD_HIT_EV_THRESHOLD = float(os.getenv("HARD_HIT_EV_THRESHOLD", "100"))
 ELITE_HARD_HIT_EV = float(os.getenv("ELITE_HARD_HIT_EV", "110"))
 
@@ -108,6 +109,7 @@ daily_recap_running = False
 processed_message_ids = set()
 hard_hit_tracker = {}
 pitcher_hard_hit_tracker = {}
+bvp_hr_history_cache = {}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("mlb_hr_alert_bot")
@@ -935,11 +937,13 @@ async def maybe_send_pitcher_weakspot_alert(channel, game, play, metrics):
             "targets": set(),
             "target_keys": {},
             "target_evs": {},
+            "target_ids": {},
         },
     )
     pdata.setdefault("targets", set())
     pdata.setdefault("target_keys", {})
     pdata.setdefault("target_evs", {})
+    pdata.setdefault("target_ids", {})
 
     pdata["count"] += 1
 
@@ -955,6 +959,7 @@ async def maybe_send_pitcher_weakspot_alert(channel, game, play, metrics):
         pdata["targets"].add(batter_name)
         pdata["target_keys"][batter_name] = batter_key
         pdata["target_evs"][batter_name] = max(float(pdata["target_evs"].get(batter_name, 0.0)), ev)
+        pdata["target_ids"][batter_name] = batter.get("id")
 
     pitcher_hard_hit_tracker[key] = pdata
 
@@ -993,23 +998,39 @@ async def maybe_send_pitcher_weakspot_alert(channel, game, play, metrics):
     eligible_targets = []
     target_keys = pdata.get("target_keys", {})
     target_evs = pdata.get("target_evs", {})
+    target_ids = pdata.get("target_ids", {})
 
     for hitter in list(pdata["targets"]):
         hitter_key = target_keys.get(hitter)
         if hitter_key and hitter_key in state["seen_hr_alerts"]:
             continue
-        eligible_targets.append((hitter, float(target_evs.get(hitter, 0.0))))
+        eligible_targets.append((hitter, float(target_evs.get(hitter, 0.0)), target_ids.get(hitter)))
 
     eligible_targets.sort(key=lambda row: (-row[1], row[0]))
 
     if not eligible_targets:
         return
 
-    for hitter, hitter_ev in eligible_targets[:3]:
+    pitcher_id = pitcher.get("id")
+
+    for hitter, hitter_ev, hitter_id in eligible_targets[:3]:
+        history = get_batter_vs_pitcher_hr_history(hitter_id, pitcher_id)
+        bvp_hr = int(history.get("home_runs", 0) or 0)
+        at_bats = history.get("at_bats")
+
+        parts = []
         if hitter_ev > 0:
-            lines.append(f"• {hitter} — {hitter_ev:.1f} EV")
+            parts.append(f"{hitter_ev:.1f} EV")
+
+        if bvp_hr > 0:
+            if at_bats is not None:
+                parts.append(f"{bvp_hr} career HR vs {pitcher_name} in {at_bats} AB")
+            else:
+                parts.append(f"{bvp_hr} career HR vs {pitcher_name}")
         else:
-            lines.append(f"• {hitter}")
+            parts.append(f"0 career HR vs {pitcher_name}")
+
+        lines.append(f"• {hitter} — " + " | ".join(parts))
 
     target_channel = await get_optional_alert_channel(channel, DISCORD_PITCHER_WEAKSPOT_CHANNEL_ID, "pitcher damage watch")
     await safe_discord_send(target_channel, "\n".join(lines))
@@ -1453,6 +1474,46 @@ def get_pitcher_hr_per_9(pitcher_id):
     except Exception as exc:
         log.warning("Could not load pitcher HR/9 for %s: %s", pitcher_id, exc)
         return None
+
+
+
+def get_batter_vs_pitcher_hr_history(batter_id, pitcher_id):
+    """
+    Returns career batter-vs-pitcher HR history using MLB StatsAPI vsPlayer split.
+    Cached in memory so weak-pitcher alerts do not repeatedly hit the API.
+    """
+    if not ENABLE_BVP_HR_HISTORY or not batter_id or not pitcher_id:
+        return {"home_runs": 0, "at_bats": None, "hits": None}
+
+    cache_key = f"{batter_id}:{pitcher_id}"
+    if cache_key in bvp_hr_history_cache:
+        return bvp_hr_history_cache[cache_key]
+
+    result = {"home_runs": 0, "at_bats": None, "hits": None}
+
+    try:
+        url = (
+            f"https://statsapi.mlb.com/api/v1/people/{batter_id}/stats"
+            f"?stats=vsPlayer&group=hitting&opposingPlayerId={pitcher_id}"
+        )
+        data = get_json(url)
+
+        for stat_group in data.get("stats", []) or []:
+            for split in stat_group.get("splits", []) or []:
+                stat = split.get("stat", {}) or {}
+                result["home_runs"] += int(stat.get("homeRuns", 0) or 0)
+
+                if stat.get("atBats") is not None:
+                    result["at_bats"] = int(stat.get("atBats", 0) or 0)
+
+                if stat.get("hits") is not None:
+                    result["hits"] = int(stat.get("hits", 0) or 0)
+
+    except Exception as exc:
+        log.warning("Could not load BvP HR history batter=%s pitcher=%s: %s", batter_id, pitcher_id, exc)
+
+    bvp_hr_history_cache[cache_key] = result
+    return result
 
 
 def collect_recent_contact_for_player(player_id, days=3):
