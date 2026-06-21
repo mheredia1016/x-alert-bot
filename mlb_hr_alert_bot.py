@@ -5,6 +5,7 @@ import logging
 import random
 from pathlib import Path
 from datetime import datetime, timedelta
+from urllib.parse import quote_plus
 
 import discord
 import requests
@@ -15,6 +16,31 @@ DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
 DISCORD_STRIKEOUT_CHANNEL_ID = int(os.getenv("DISCORD_STRIKEOUT_CHANNEL_ID", "0"))
 DISCORD_HARD_HIT_CHANNEL_ID = int(os.getenv("DISCORD_HARD_HIT_CHANNEL_ID", "0"))
 DISCORD_PITCHER_WEAKSPOT_CHANNEL_ID = int(os.getenv("DISCORD_PITCHER_WEAKSPOT_CHANNEL_ID", "0"))
+DISCORD_NEAR_HR_CHANNEL_ID = int(os.getenv("DISCORD_NEAR_HR_CHANNEL_ID", "0"))
+DISCORD_CYCLE_CHANNEL_ID = int(os.getenv("DISCORD_CYCLE_CHANNEL_ID", "0"))
+ENABLE_CYCLE_WATCH = os.getenv("ENABLE_CYCLE_WATCH", "true").lower() == "true"
+CYCLE_WATCH_MIN_INNING = int(os.getenv("CYCLE_WATCH_MIN_INNING", "5"))
+FANDUEL_MLB_DEEPLINK = os.getenv("FANDUEL_MLB_DEEPLINK", "https://sportsbook.fanduel.com/navigation/mlb")
+FANDUEL_HR_DEEPLINK = os.getenv("FANDUEL_HR_DEEPLINK", FANDUEL_MLB_DEEPLINK)
+FANDUEL_TRIPLE_DEEPLINK = os.getenv("FANDUEL_TRIPLE_DEEPLINK", FANDUEL_MLB_DEEPLINK)
+FANDUEL_DOUBLE_DEEPLINK = os.getenv("FANDUEL_DOUBLE_DEEPLINK", FANDUEL_MLB_DEEPLINK)
+FANDUEL_HIT_DEEPLINK = os.getenv("FANDUEL_HIT_DEEPLINK", FANDUEL_MLB_DEEPLINK)
+
+# Optional comma-separated FanDuel link pools.
+# The bot will include every configured candidate link for the remaining prop.
+FANDUEL_HR_DEEPLINKS = os.getenv("FANDUEL_HR_DEEPLINKS", "")
+FANDUEL_TRIPLE_DEEPLINKS = os.getenv("FANDUEL_TRIPLE_DEEPLINKS", "")
+FANDUEL_DOUBLE_DEEPLINKS = os.getenv("FANDUEL_DOUBLE_DEEPLINKS", "")
+FANDUEL_HIT_DEEPLINKS = os.getenv("FANDUEL_HIT_DEEPLINKS", "")
+ENABLE_CYCLE_FANDUEL_ODDS = os.getenv("ENABLE_CYCLE_FANDUEL_ODDS", "true").lower() == "true"
+CYCLE_FANDUEL_BOOKMAKER_KEY = os.getenv("CYCLE_FANDUEL_BOOKMAKER_KEY", "fanduel")
+CYCLE_MARKET_HR = os.getenv("CYCLE_MARKET_HR", "batter_home_runs")
+CYCLE_MARKET_TRIPLE = os.getenv("CYCLE_MARKET_TRIPLE", "batter_triples")
+CYCLE_MARKET_DOUBLE = os.getenv("CYCLE_MARKET_DOUBLE", "batter_doubles")
+CYCLE_MARKET_HIT = os.getenv("CYCLE_MARKET_HIT", "batter_hits")
+CYCLE_ODDS_CACHE_SECONDS = int(os.getenv("CYCLE_ODDS_CACHE_SECONDS", "60"))
+cycle_odds_cache = {}
+
 ENABLE_STRIKEOUT_ALERTS = os.getenv("ENABLE_STRIKEOUT_ALERTS", "false").lower() == "true"
 STRIKEOUT_ALERT_MIN_KS = int(os.getenv("STRIKEOUT_ALERT_MIN_KS", "3"))
 STRIKEOUT_ALERT_MAX_INNING = int(os.getenv("STRIKEOUT_ALERT_MAX_INNING", "2"))
@@ -135,6 +161,7 @@ state = {
     "seen_hard_hit_alerts": [],
     "seen_hr_alerts": [],
     "seen_pitcher_weakspot_alerts": [],
+    "seen_cycle_alerts": [],
 }
 
 TEAM_COLORS = {
@@ -183,6 +210,7 @@ def load_state():
     state.setdefault("seen_hard_hit_alerts", [])
     state.setdefault("seen_hr_alerts", [])
     state.setdefault("seen_pitcher_weakspot_alerts", [])
+    state.setdefault("seen_cycle_alerts", [])
 
 
 def save_state():
@@ -191,6 +219,7 @@ def save_state():
     state["pending_near_hr_play_ids"] = state["pending_near_hr_play_ids"][-1000:]
     state["seen_strikeout_alerts"] = state.get("seen_strikeout_alerts", [])[-500:]
     state["seen_hr_alerts"] = state.get("seen_hr_alerts", [])[-500:]
+    state["seen_cycle_alerts"] = state.get("seen_cycle_alerts", [])[-500:]
     for extra_key in ("seen_no_hr_3rd_game_ids", "seen_more_hr_odds_keys", "seen_pregame_parlay_game_ids"):
         if extra_key in state:
             state[extra_key] = state[extra_key][-500:]
@@ -534,7 +563,20 @@ async def confirm_and_send_near_hr(channel, game, play_id):
                 state["pending_near_hr_play_ids"].remove(play_id)
 
             if not already_seen_or_claim("seen_near_hr_play_ids", play_id):
-                await send_alert(channel, game, refreshed_play, "near", plays)
+
+                near_channel = await get_optional_alert_channel(
+                    channel,
+                    DISCORD_NEAR_HR_CHANNEL_ID,
+                    "near-hr"
+                )
+
+                await send_alert(
+                    near_channel,
+                    game,
+                    refreshed_play,
+                    "near",
+                    plays
+                )
 
             processing_near_play_ids.discard(play_id)
             save_state()
@@ -1040,6 +1082,408 @@ async def maybe_send_pitcher_weakspot_alert(channel, game, play, metrics):
 
 
 
+
+# =========================
+# LIVE CYCLE PROP WATCH
+# =========================
+
+def hit_type_from_play(play):
+    result = play.get("result", {}) or {}
+    event_type = (result.get("eventType") or "").lower().strip()
+    event = (result.get("event") or "").lower().strip()
+
+    if event_type == "single" or event == "single":
+        return "1B"
+    if event_type == "double" or event == "double":
+        return "2B"
+    if event_type == "triple" or event == "triple":
+        return "3B"
+    if is_home_run(play):
+        return "HR"
+    return None
+
+
+def current_inning_from_plays(plays):
+    inning = 0
+    for play in plays:
+        about = play.get("about", {}) or {}
+        try:
+            inning = max(inning, int(about.get("inning") or 0))
+        except Exception:
+            continue
+    return inning
+
+
+
+def normalize_name_for_match(value):
+    return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+
+def american_odds_text(price):
+    if price is None:
+        return "N/A"
+    try:
+        price = int(price)
+        return f"+{price}" if price > 0 else str(price)
+    except Exception:
+        return str(price)
+
+def cycle_market_for_missing(missing):
+    if missing == "HR":
+        return CYCLE_MARKET_HR
+    if missing == "3B":
+        return CYCLE_MARKET_TRIPLE
+    if missing == "2B":
+        return CYCLE_MARKET_DOUBLE
+    if missing == "1B":
+        return CYCLE_MARKET_HIT
+    return CYCLE_MARKET_HIT
+
+def get_odds_api_events():
+    if not ODDS_API_KEY:
+        return []
+    url = f"{ODDS_API_BASE}/sports/{ODDS_SPORT_KEY}/events"
+    return get_odds_json(url, {"apiKey": ODDS_API_KEY})
+
+def names_match(a, b):
+    aa = normalize_name_for_match(a)
+    bb = normalize_name_for_match(b)
+    return bool(aa and bb and (aa in bb or bb in aa))
+
+def find_odds_event_for_game(game):
+    away = game.get("away") or {}
+    home = game.get("home") or {}
+    away_names = [
+        away.get("name"),
+        away.get("teamName"),
+        away.get("abbreviation"),
+    ]
+    home_names = [
+        home.get("name"),
+        home.get("teamName"),
+        home.get("abbreviation"),
+    ]
+
+    events = get_odds_api_events()
+    for ev in events:
+        ev_home = ev.get("home_team", "")
+        ev_away = ev.get("away_team", "")
+
+        away_ok = any(names_match(x, ev_away) for x in away_names if x)
+        home_ok = any(names_match(x, ev_home) for x in home_names if x)
+
+        # Some sources flip naming around; allow either team pair match.
+        away_flip = any(names_match(x, ev_home) for x in away_names if x)
+        home_flip = any(names_match(x, ev_away) for x in home_names if x)
+
+        if (away_ok and home_ok) or (away_flip and home_flip):
+            return ev
+
+    return None
+
+def extract_any_link(*items):
+    # The Odds API may expose links at different levels depending on plan/book.
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for key in ("link", "url", "deep_link", "deeplink"):
+            val = item.get(key)
+            if val:
+                return val
+    return None
+
+def fetch_fanduel_player_prop(game, player_name, missing):
+    if not ENABLE_CYCLE_FANDUEL_ODDS or not ODDS_API_KEY:
+        return None
+
+    market_key = cycle_market_for_missing(missing)
+    cache_key = f"{game.get('gamePk')}:{player_name}:{market_key}"
+    now_ts = datetime.now(TZ).timestamp()
+
+    cached = cycle_odds_cache.get(cache_key)
+    if cached and now_ts - cached.get("ts", 0) <= CYCLE_ODDS_CACHE_SECONDS:
+        return cached.get("value")
+
+    try:
+        odds_event = find_odds_event_for_game(game)
+        if not odds_event or not odds_event.get("id"):
+            value = None
+        else:
+            url = f"{ODDS_API_BASE}/sports/{ODDS_SPORT_KEY}/events/{odds_event['id']}/odds"
+            data = get_odds_json(
+                url,
+                {
+                    "apiKey": ODDS_API_KEY,
+                    "regions": ODDS_REGION,
+                    "markets": market_key,
+                    "bookmakers": CYCLE_FANDUEL_BOOKMAKER_KEY,
+                    "oddsFormat": ODDS_FORMAT,
+                },
+            )
+
+            value = None
+            for book in data.get("bookmakers", []) or []:
+                book_key = str(book.get("key") or "").lower()
+                book_title = str(book.get("title") or "").lower()
+
+                if "fanduel" not in book_key and "fanduel" not in book_title:
+                    continue
+
+                for market in book.get("markets", []) or []:
+                    if market.get("key") != market_key:
+                        continue
+
+                    for outcome in market.get("outcomes", []) or []:
+                        desc = outcome.get("description") or outcome.get("name") or ""
+                        name = outcome.get("name") or ""
+                        target_text = f"{desc} {name}"
+
+                        # Player props usually have player in description and Over/Yes in name.
+                        if not names_match(player_name, target_text):
+                            continue
+
+                        odds_price = outcome.get("price")
+                        point = outcome.get("point")
+                        link = extract_any_link(outcome, market, book, data)
+
+                        value = {
+                            "book": book.get("title") or "FanDuel",
+                            "marketKey": market_key,
+                            "market": market.get("key") or market_key,
+                            "player": player_name,
+                            "outcomeName": outcome.get("name"),
+                            "description": outcome.get("description"),
+                            "price": odds_price,
+                            "oddsText": american_odds_text(odds_price),
+                            "point": point,
+                            "link": link,
+                        }
+                        break
+                    if value:
+                        break
+                if value:
+                    break
+
+        cycle_odds_cache[cache_key] = {"ts": now_ts, "value": value}
+        return value
+
+    except Exception as exc:
+        log.warning("Could not load FanDuel cycle prop odds for %s missing %s: %s", player_name, missing, exc)
+        cycle_odds_cache[cache_key] = {"ts": now_ts, "value": None}
+        return None
+
+def fanduel_prop_display(odds_row, fallback_links):
+    if odds_row:
+        link = odds_row.get("link") or (fallback_links[0] if fallback_links else FANDUEL_MLB_DEEPLINK)
+        odds = odds_row.get("oddsText") or american_odds_text(odds_row.get("price"))
+        outcome_name = odds_row.get("outcomeName") or "Yes/Over"
+        desc = odds_row.get("description") or odds_row.get("player") or ""
+        return {
+            "text": f"FanDuel {odds} — {desc} {outcome_name}".strip(),
+            "link": link,
+            "odds": odds,
+        }
+
+    return {
+        "text": "FanDuel odds not found yet",
+        "link": fallback_links[0] if fallback_links else FANDUEL_MLB_DEEPLINK,
+        "odds": "N/A",
+    }
+
+
+def split_links(value):
+    return [x.strip() for x in str(value or "").split(",") if x.strip()]
+
+def unique_links(links):
+    out = []
+    seen = set()
+    for link in links:
+        if not link or link in seen:
+            continue
+        seen.add(link)
+        out.append(link)
+    return out
+
+def fanduel_search_link(player_name, prop_name):
+    query = quote_plus(f"{player_name} {prop_name}")
+    return f"https://sportsbook.fanduel.com/search?query={query}"
+
+def cycle_prop_for_missing(missing, player_name=""):
+    if missing == "HR":
+        prop = "To Hit A Home Run"
+        links = split_links(FANDUEL_HR_DEEPLINKS) + [FANDUEL_HR_DEEPLINK]
+        stars = "⭐⭐⭐⭐⭐"
+    elif missing == "3B":
+        prop = "To Record A Triple"
+        links = split_links(FANDUEL_TRIPLE_DEEPLINKS) + [FANDUEL_TRIPLE_DEEPLINK]
+        stars = "⭐"
+    elif missing == "2B":
+        prop = "To Record A Double"
+        links = split_links(FANDUEL_DOUBLE_DEEPLINKS) + [FANDUEL_DOUBLE_DEEPLINK]
+        stars = "⭐⭐⭐"
+    elif missing == "1B":
+        prop = "To Record A Hit"
+        links = split_links(FANDUEL_HIT_DEEPLINKS) + [FANDUEL_HIT_DEEPLINK]
+        stars = "⭐⭐⭐⭐"
+    else:
+        prop = "Player Prop"
+        links = [FANDUEL_MLB_DEEPLINK]
+        stars = "—"
+
+    # Always include MLB landing and a player/prop search fallback.
+    links += [
+        FANDUEL_MLB_DEEPLINK,
+        fanduel_search_link(player_name, prop),
+    ]
+
+    return prop, unique_links(links), stars
+
+
+def collect_cycle_watch_candidates(game, plays):
+    current_inning = current_inning_from_plays(plays)
+    if current_inning < CYCLE_WATCH_MIN_INNING:
+        return []
+
+    by_player = {}
+
+    for play in plays:
+        hit_type = hit_type_from_play(play)
+        if not hit_type:
+            continue
+
+        matchup = play.get("matchup", {}) or {}
+        batter = matchup.get("batter", {}) or {}
+        batter_id = batter.get("id")
+        batter_name = batter.get("fullName", "Unknown")
+
+        if not batter_id and not batter_name:
+            continue
+
+        key = f"{game.get('gamePk')}:{batter_id or batter_name}"
+        about = play.get("about", {}) or {}
+        team = game["away"] if about.get("halfInning") == "top" else game["home"]
+        team_abbr = team.get("abbreviation", "MLB")
+
+        row = by_player.setdefault(
+            key,
+            {
+                "key": key,
+                "player_id": batter_id,
+                "name": batter_name,
+                "team_abbr": team_abbr,
+                "hits": set(),
+                "hit_events": [],
+                "latest_inning": about.get("inning"),
+            },
+        )
+
+        row["hits"].add(hit_type)
+        row["hit_events"].append(hit_type)
+        row["latest_inning"] = about.get("inning") or row.get("latest_inning")
+
+    candidates = []
+    full_cycle = {"1B", "2B", "3B", "HR"}
+
+    for row in by_player.values():
+        hits = set(row["hits"])
+        if len(hits) != 3:
+            continue
+
+        missing = list(full_cycle - hits)
+        if len(missing) != 1:
+            continue
+
+        row["missing"] = missing[0]
+        candidates.append(row)
+
+    return candidates
+
+
+async def maybe_send_cycle_watch_alerts(channel, game, plays):
+    if not ENABLE_CYCLE_WATCH:
+        return
+
+    state.setdefault("seen_cycle_alerts", [])
+
+    target_channel = await get_optional_alert_channel(
+        channel,
+        DISCORD_CYCLE_CHANNEL_ID,
+        "cycle-watch"
+    )
+
+    for row in collect_cycle_watch_candidates(game, plays):
+        alert_key = f"{row['key']}:{row['missing']}"
+
+        if alert_key in state["seen_cycle_alerts"]:
+            continue
+
+        prop_name, deep_links, probability = cycle_prop_for_missing(row["missing"], row["name"])
+        fanduel_odds = await asyncio.to_thread(
+            fetch_fanduel_player_prop,
+            game,
+            row["name"],
+            row["missing"]
+        )
+        fd_display = fanduel_prop_display(fanduel_odds, deep_links)
+        deep_link = fd_display["link"]
+
+        has_1b = "✅" if "1B" in row["hits"] else "❌"
+        has_2b = "✅" if "2B" in row["hits"] else "❌"
+        has_3b = "✅" if "3B" in row["hits"] else "❌"
+        has_hr = "✅" if "HR" in row["hits"] else "❌"
+
+        embed = discord.Embed(
+            title="🚲 Live Cycle Prop Watch",
+            description=(
+                f"**{row['name']} ({row['team_abbr']})** is one leg away from the cycle.\n\n"
+                f"{has_1b} Single\n"
+                f"{has_2b} Double\n"
+                f"{has_3b} Triple\n"
+                f"{has_hr} Home Run\n\n"
+                f"🎯 **Remaining Prop:** {prop_name}\n"
+                f"💰 **FanDuel Odds:** {fd_display['odds']}\n"
+                f"Cycle Probability: {probability}\n\n"
+                f"🔥 **FanDuel Play:** {fd_display['text']}\n"
+                f"🔗 **Deep Link:** {deep_link}"
+            ),
+            color=discord.Color.teal(),
+            url=deep_link,
+        )
+
+        embed.add_field(name="Game", value=game_label(game), inline=False)
+        embed.add_field(name="Missing", value=row["missing"], inline=True)
+        embed.add_field(name="Hits Today", value=str(len(row["hit_events"])), inline=True)
+        embed.add_field(name="FanDuel Market", value=cycle_market_for_missing(row["missing"]), inline=True)
+        link_lines = []
+        check_links = unique_links([deep_link] + deep_links)
+        for idx, link in enumerate(check_links[:5], start=1):
+            label = "FanDuel Odds Link" if idx == 1 else f"Backup {idx-1}"
+            link_lines.append(f"[{label}]({link})")
+        if link_lines:
+            embed.add_field(
+                name="FanDuel Links To Check",
+                value=" • ".join(link_lines),
+                inline=False
+            )
+
+
+        headshot_url = player_headshot(row.get("player_id"))
+        if headshot_url:
+            embed.set_image(url=headshot_url)
+
+        logo_url = team_logo(row.get("team_abbr"))
+        if logo_url:
+            embed.set_thumbnail(url=logo_url)
+
+        embed.set_footer(
+            text=f"Trigger: 3 of 4 cycle legs after inning {CYCLE_WATCH_MIN_INNING}. Link opens the remaining prop market."
+        )
+
+        await safe_discord_send(target_channel, embed=embed)
+
+        state["seen_cycle_alerts"].append(alert_key)
+        save_state()
+
+
 # =========================
 # STRIKEOUT ALERTS
 # =========================
@@ -1234,6 +1678,8 @@ async def process_game(channel, game):
     await maybe_send_strikeout_alerts(channel, game, data)
 
     await maybe_send_no_hr_3rd_alert(channel, game, plays)
+
+    await maybe_send_cycle_watch_alerts(channel, game, plays)
 
     for play in plays:
         if "play_is_recent" in globals() and not play_is_recent(play):
@@ -2499,6 +2945,9 @@ async def on_ready():
         log.info("Morning HR parlays enabled: %s", ENABLE_MORNING_HR_PARLAYS)
         log.info("Strikeout alerts enabled: %s channel=%s", ENABLE_STRIKEOUT_ALERTS, DISCORD_STRIKEOUT_CHANNEL_ID or "main")
         log.info("Hard-hit channel=%s pitcher weakspot channel=%s", DISCORD_HARD_HIT_CHANNEL_ID or "main", DISCORD_PITCHER_WEAKSPOT_CHANNEL_ID or "main")
+        log.info("Near-HR channel=%s", DISCORD_NEAR_HR_CHANNEL_ID or "main")
+        log.info("Cycle watch enabled=%s channel=%s min_inning=%s", ENABLE_CYCLE_WATCH, DISCORD_CYCLE_CHANNEL_ID or "main", CYCLE_WATCH_MIN_INNING)
+        log.info("Cycle FanDuel odds enabled=%s bookmaker=%s", ENABLE_CYCLE_FANDUEL_ODDS, CYCLE_FANDUEL_BOOKMAKER_KEY)
     else:
         log.info("Live alert loop already running")
 

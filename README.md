@@ -1,28 +1,22 @@
-# MLB HR + Near-HR Discord Bot
+# MLB HR Alert Bot — Near HR Separate Channel + Cycle Watch
 
-Railway-ready Discord bot that watches MLB live game feeds and posts:
+This is the live HR alert bot.
 
-- 💣 Home Run alerts
-- ⚠️ Near Home Run alerts (heuristic based on EV, launch angle, and projected distance)
+Near HR separate channel:
+- Add DISCORD_NEAR_HR_CHANNEL_ID=<near HR channel id>
+- Home run alerts stay in DISCORD_CHANNEL_ID
+- Near home run alerts go to DISCORD_NEAR_HR_CHANNEL_ID
 
-## Required Railway variables
+Cycle Watch is also included, but you can leave it disabled until ready.
 
-- `DISCORD_TOKEN`
-- `DISCORD_CHANNEL_ID`
+Cycle required variables when ready:
+- ENABLE_CYCLE_WATCH=true
+- DISCORD_CYCLE_CHANNEL_ID=<cycle channel id>
+- ODDS_API_KEY=<your The Odds API key>
 
-## Optional Railway variables
-
-- `POLL_SECONDS=15`
-- `TIMEZONE=America/Chicago`
-- `NEAR_HR_MIN_EV=100`
-- `NEAR_HR_MIN_ANGLE=20`
-- `NEAR_HR_MAX_ANGLE=40`
-- `NEAR_HR_MIN_DISTANCE=360`
-
-## Files
-
-- `mlb_hr_alert_bot.py`
-- `requirements.txt`
-- `Procfile`
-- `runtime.txt`
-- `.gitignore`
+Recommended cycle variables:
+- ENABLE_CYCLE_FANDUEL_ODDS=true
+- CYCLE_WATCH_MIN_INNING=5
+- CYCLE_FANDUEL_BOOKMAKER_KEY=fanduel
+- ODDS_REGION=us
+- ODDS_FORMAT=american
