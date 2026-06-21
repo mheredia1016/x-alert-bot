@@ -97,6 +97,21 @@ ODDS_CACHE_MINUTES = int(os.getenv("ODDS_CACHE_MINUTES", "60"))
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 ODDS_SPORT_KEY = "baseball_mlb"
 
+# SportsGameOdds for live Cycle Watch FanDuel props/deep links
+SPORTSGAMEODDS_API_KEY = os.getenv("SPORTSGAMEODDS_API_KEY", os.getenv("SGO_API_KEY", ""))
+SPORTSGAMEODDS_API_BASE = os.getenv("SPORTSGAMEODDS_API_BASE", "https://api.sportsgameodds.com/v2").rstrip("/")
+SPORTSGAMEODDS_MLB_LEAGUE_ID = os.getenv("SPORTSGAMEODDS_MLB_LEAGUE_ID", os.getenv("SGO_MLB_LEAGUE_ID", ""))
+SPORTSGAMEODDS_FANDUEL_BOOKMAKER_ID = os.getenv("SPORTSGAMEODDS_FANDUEL_BOOKMAKER_ID", "fanduel")
+ENABLE_CYCLE_SGO_ODDS = os.getenv("ENABLE_CYCLE_SGO_ODDS", "true").lower() == "true"
+CYCLE_SGO_LOOKBACK_MINUTES = int(os.getenv("CYCLE_SGO_LOOKBACK_MINUTES", "0"))
+CYCLE_SGO_LOOKAHEAD_HOURS = int(os.getenv("CYCLE_SGO_LOOKAHEAD_HOURS", "16"))
+CYCLE_SGO_CACHE_SECONDS = int(os.getenv("CYCLE_SGO_CACHE_SECONDS", "45"))
+CYCLE_SGO_MARKET_HR_KEYWORDS = os.getenv("CYCLE_SGO_MARKET_HR_KEYWORDS", "home run,homer,home_runs,batter_home_runs")
+CYCLE_SGO_MARKET_TRIPLE_KEYWORDS = os.getenv("CYCLE_SGO_MARKET_TRIPLE_KEYWORDS", "triple,triples,batter_triples")
+CYCLE_SGO_MARKET_DOUBLE_KEYWORDS = os.getenv("CYCLE_SGO_MARKET_DOUBLE_KEYWORDS", "double,doubles,batter_doubles")
+CYCLE_SGO_MARKET_HIT_KEYWORDS = os.getenv("CYCLE_SGO_MARKET_HIT_KEYWORDS", "hit,hits,batter_hits")
+cycle_sgo_cache = {}
+
 # Morning HR parlay section in daily report
 ENABLE_MORNING_HR_PARLAYS = os.getenv("ENABLE_MORNING_HR_PARLAYS", "true").lower() == "true"
 MORNING_PARLAY_LEGS_SAFE = int(os.getenv("MORNING_PARLAY_LEGS_SAFE", "2"))
@@ -1191,6 +1206,155 @@ def extract_any_link(*items):
                 return val
     return None
 
+
+def sgo_get_json(path, params=None):
+    if not SPORTSGAMEODDS_API_KEY:
+        return None
+    url = f"{SPORTSGAMEODDS_API_BASE}{path}"
+    headers = {
+        "x-api-key": SPORTSGAMEODDS_API_KEY,
+        "accept": "application/json",
+    }
+    r = session.get(url, params=params or {}, headers=headers, timeout=25)
+    r.raise_for_status()
+    return r.json()
+
+def sgo_keywords_for_missing(missing):
+    if missing == "HR":
+        return [x.strip().lower() for x in CYCLE_SGO_MARKET_HR_KEYWORDS.split(",") if x.strip()]
+    if missing == "3B":
+        return [x.strip().lower() for x in CYCLE_SGO_MARKET_TRIPLE_KEYWORDS.split(",") if x.strip()]
+    if missing == "2B":
+        return [x.strip().lower() for x in CYCLE_SGO_MARKET_DOUBLE_KEYWORDS.split(",") if x.strip()]
+    if missing == "1B":
+        return [x.strip().lower() for x in CYCLE_SGO_MARKET_HIT_KEYWORDS.split(",") if x.strip()]
+    return []
+
+def flatten_dicts(obj):
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from flatten_dicts(v)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from flatten_dicts(item)
+
+def sgo_text_blob(d):
+    parts = []
+    if isinstance(d, dict):
+        for k, v in d.items():
+            if isinstance(v, (str, int, float)):
+                parts.append(str(k))
+                parts.append(str(v))
+    return " ".join(parts).lower()
+
+def sgo_extract_price(d):
+    for key in ("price", "odds", "americanOdds", "american", "bookOdds", "bookPrice"):
+        if key in d and d.get(key) not in (None, ""):
+            return d.get(key)
+    return None
+
+def sgo_extract_link(d):
+    for key in (
+        "deepLink", "deeplink", "deep_link", "link", "url", "betUrl", "betURL",
+        "sportsbookUrl", "sportsbookURL", "appLink", "webUrl", "webURL"
+    ):
+        if isinstance(d, dict) and d.get(key):
+            return d.get(key)
+    return None
+
+def sgo_is_fanduel(d):
+    blob = sgo_text_blob(d)
+    book = (SPORTSGAMEODDS_FANDUEL_BOOKMAKER_ID or "fanduel").lower()
+    return "fanduel" in blob or book in blob
+
+def sgo_market_matches(d, player_name, missing):
+    blob = sgo_text_blob(d)
+    if not names_match(player_name, blob):
+        return False
+    if not sgo_is_fanduel(d):
+        return False
+    keywords = sgo_keywords_for_missing(missing)
+    return any(k in blob for k in keywords)
+
+def sgo_event_matches_game(d, game):
+    blob = sgo_text_blob(d)
+    away = game.get("away") or {}
+    home = game.get("home") or {}
+    checks = [
+        away.get("name"), away.get("teamName"), away.get("abbreviation"),
+        home.get("name"), home.get("teamName"), home.get("abbreviation"),
+    ]
+    found = [x for x in checks if x and normalize_name_for_match(x) in normalize_name_for_match(blob)]
+    return len(found) >= 2
+
+def fetch_sgo_events():
+    params = {
+        "oddsAvailable": "true",
+        "includeAltLines": "true",
+        "limit": "500",
+    }
+    if SPORTSGAMEODDS_MLB_LEAGUE_ID:
+        params["leagueID"] = SPORTSGAMEODDS_MLB_LEAGUE_ID
+    try:
+        return sgo_get_json("/events", params=params)
+    except Exception as exc:
+        log.warning("SportsGameOdds /events failed: %s", exc)
+        return None
+
+def fetch_sgo_player_prop(game, player_name, missing):
+    if not ENABLE_CYCLE_SGO_ODDS or not SPORTSGAMEODDS_API_KEY:
+        return None
+
+    cache_key = f"sgo:{game.get('gamePk')}:{player_name}:{missing}"
+    now_ts = datetime.now(TZ).timestamp()
+    cached = cycle_sgo_cache.get(cache_key)
+    if cached and now_ts - cached.get("ts", 0) <= CYCLE_SGO_CACHE_SECONDS:
+        return cached.get("value")
+
+    value = None
+    try:
+        # First pull slate events. This works on plans that require leagueID.
+        payload = fetch_sgo_events()
+        candidates = list(flatten_dicts(payload))
+
+        # Narrow to this game when possible.
+        game_candidates = [d for d in candidates if sgo_event_matches_game(d, game)]
+        search_pool = game_candidates or candidates
+
+        matches = [d for d in search_pool if sgo_market_matches(d, player_name, missing)]
+
+        # Prefer outcomes with a price and link.
+        matches.sort(
+            key=lambda d: (
+                1 if sgo_extract_link(d) else 0,
+                1 if sgo_extract_price(d) is not None else 0,
+            ),
+            reverse=True,
+        )
+
+        if matches:
+            best = matches[0]
+            price = sgo_extract_price(best)
+            link = sgo_extract_link(best)
+            value = {
+                "book": "FanDuel",
+                "source": "SportsGameOdds",
+                "player": player_name,
+                "missing": missing,
+                "price": price,
+                "oddsText": american_odds_text(price),
+                "link": link,
+                "rawText": sgo_text_blob(best)[:500],
+            }
+
+    except Exception as exc:
+        log.warning("Could not load SportsGameOdds FanDuel cycle prop for %s missing %s: %s", player_name, missing, exc)
+
+    cycle_sgo_cache[cache_key] = {"ts": now_ts, "value": value}
+    return value
+
+
 def fetch_fanduel_player_prop(game, player_name, missing):
     if not ENABLE_CYCLE_FANDUEL_ODDS or not ODDS_API_KEY:
         return None
@@ -1277,8 +1441,9 @@ def fanduel_prop_display(odds_row, fallback_links):
         odds = odds_row.get("oddsText") or american_odds_text(odds_row.get("price"))
         outcome_name = odds_row.get("outcomeName") or "Yes/Over"
         desc = odds_row.get("description") or odds_row.get("player") or ""
+        source = odds_row.get("source", "Odds API")
         return {
-            "text": f"FanDuel {odds} — {desc} {outcome_name}".strip(),
+            "text": f"FanDuel {odds} — {desc} {outcome_name} ({source})".strip(),
             "link": link,
             "odds": odds,
         }
@@ -1418,11 +1583,21 @@ async def maybe_send_cycle_watch_alerts(channel, game, plays):
 
         prop_name, deep_links, probability = cycle_prop_for_missing(row["missing"], row["name"])
         fanduel_odds = await asyncio.to_thread(
-            fetch_fanduel_player_prop,
+            fetch_sgo_player_prop,
             game,
             row["name"],
             row["missing"]
         )
+
+        # Fallback to The Odds API only if SportsGameOdds does not find FanDuel.
+        if not fanduel_odds:
+            fanduel_odds = await asyncio.to_thread(
+                fetch_fanduel_player_prop,
+                game,
+                row["name"],
+                row["missing"]
+            )
+
         fd_display = fanduel_prop_display(fanduel_odds, deep_links)
         deep_link = fd_display["link"]
 
@@ -2948,6 +3123,7 @@ async def on_ready():
         log.info("Near-HR channel=%s", DISCORD_NEAR_HR_CHANNEL_ID or "main")
         log.info("Cycle watch enabled=%s channel=%s min_inning=%s", ENABLE_CYCLE_WATCH, DISCORD_CYCLE_CHANNEL_ID or "main", CYCLE_WATCH_MIN_INNING)
         log.info("Cycle FanDuel odds enabled=%s bookmaker=%s", ENABLE_CYCLE_FANDUEL_ODDS, CYCLE_FANDUEL_BOOKMAKER_KEY)
+        log.info("Cycle SportsGameOdds enabled=%s leagueID=%s", ENABLE_CYCLE_SGO_ODDS, SPORTSGAMEODDS_MLB_LEAGUE_ID or "not set")
     else:
         log.info("Live alert loop already running")
 
