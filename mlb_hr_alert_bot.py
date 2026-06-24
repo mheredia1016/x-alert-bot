@@ -33,7 +33,7 @@ FANDUEL_HR_DEEPLINKS = os.getenv("FANDUEL_HR_DEEPLINKS", "")
 FANDUEL_TRIPLE_DEEPLINKS = os.getenv("FANDUEL_TRIPLE_DEEPLINKS", "")
 FANDUEL_DOUBLE_DEEPLINKS = os.getenv("FANDUEL_DOUBLE_DEEPLINKS", "")
 FANDUEL_HIT_DEEPLINKS = os.getenv("FANDUEL_HIT_DEEPLINKS", "")
-ENABLE_CYCLE_FANDUEL_ODDS = os.getenv("ENABLE_CYCLE_FANDUEL_ODDS", "true").lower() == "true"
+ENABLE_CYCLE_FANDUEL_ODDS = os.getenv("ENABLE_CYCLE_FANDUEL_ODDS", "false").lower() == "true"
 CYCLE_FANDUEL_BOOKMAKER_KEY = os.getenv("CYCLE_FANDUEL_BOOKMAKER_KEY", "fanduel")
 CYCLE_MARKET_HR = os.getenv("CYCLE_MARKET_HR", "batter_home_runs")
 CYCLE_MARKET_TRIPLE = os.getenv("CYCLE_MARKET_TRIPLE", "batter_triples")
@@ -1231,6 +1231,8 @@ def sgo_get_json(path, params=None):
         "accept": "application/json",
     }
     r = session.get(url, params=params or {}, headers=headers, timeout=25)
+    if r.status_code >= 400:
+        log.warning("SportsGameOdds error %s url=%s params=%s body=%s", r.status_code, url, params, r.text[:500])
     r.raise_for_status()
     return r.json()
 
@@ -1305,16 +1307,17 @@ def sgo_event_matches_game(d, game):
 
 def fetch_sgo_events():
     params = {
+        "leagueID": SPORTSGAMEODDS_MLB_LEAGUE_ID or "MLB",
         "oddsAvailable": "true",
-        "includeAltLines": "true",
+        "bookmakerID": SPORTSGAMEODDS_FANDUEL_BOOKMAKER_ID or "fanduel",
         "limit": "500",
     }
-    if SPORTSGAMEODDS_MLB_LEAGUE_ID:
-        params["leagueID"] = SPORTSGAMEODDS_MLB_LEAGUE_ID
     try:
-        return sgo_get_json("/events", params=params)
+        # SportsGameOdds docs list GET /events/ and support leagueID, oddsAvailable,
+        # bookmakerID, and limit. Keep this request simple to avoid 400 Invalid params.
+        return sgo_get_json("/events/", params=params)
     except Exception as exc:
-        log.warning("SportsGameOdds /events failed: %s", exc)
+        log.warning("SportsGameOdds /events failed. Check SPORTSGAMEODDS_API_KEY and leagueID=MLB. Error: %s", exc)
         return None
 
 def fetch_sgo_player_prop(game, player_name, missing):
@@ -1464,7 +1467,7 @@ def fanduel_prop_display(odds_row, fallback_links):
         }
 
     return {
-        "text": "FanDuel odds not found yet",
+        "text": "FanDuel odds not found from SportsGameOdds yet",
         "link": fallback_links[0] if fallback_links else FANDUEL_MLB_DEEPLINK,
         "odds": "N/A",
     }
@@ -1617,14 +1620,7 @@ async def maybe_send_cycle_watch_alerts(channel, game, plays):
                 prop["missing"]
             )
 
-            if not fanduel_odds:
-                fanduel_odds = await asyncio.to_thread(
-                    fetch_fanduel_player_prop,
-                    game,
-                    row["name"],
-                    prop["missing"]
-                )
-
+            # SportsGameOdds only. Do not fall back to The Odds API.
             fd_display = fanduel_prop_display(fanduel_odds, prop["links"])
 
             if primary_link == FANDUEL_MLB_DEEPLINK and fd_display.get("link"):
@@ -3160,7 +3156,6 @@ async def on_ready():
         log.info("Hard-hit channel=%s pitcher weakspot channel=%s", DISCORD_HARD_HIT_CHANNEL_ID or "main", DISCORD_PITCHER_WEAKSPOT_CHANNEL_ID or "main")
         log.info("Near-HR channel=%s", DISCORD_NEAR_HR_CHANNEL_ID or "main")
         log.info("Cycle watch enabled=%s channel=%s min_inning=%s min_legs=%s", ENABLE_CYCLE_WATCH, DISCORD_CYCLE_CHANNEL_ID or "main", CYCLE_WATCH_MIN_INNING, CYCLE_WATCH_MIN_LEGS)
-        log.info("Cycle FanDuel odds enabled=%s bookmaker=%s", ENABLE_CYCLE_FANDUEL_ODDS, CYCLE_FANDUEL_BOOKMAKER_KEY)
         log.info("Cycle SportsGameOdds enabled=%s leagueID=%s", ENABLE_CYCLE_SGO_ODDS, SPORTSGAMEODDS_MLB_LEAGUE_ID or "not set")
     else:
         log.info("Live alert loop already running")
