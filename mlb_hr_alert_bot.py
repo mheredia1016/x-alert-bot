@@ -1306,19 +1306,98 @@ def sgo_event_matches_game(d, game):
     return len(found) >= 2
 
 def fetch_sgo_events():
+    """
+    Cache today's MLB events once instead of calling /events for every prop.
+    SportsGameOdds max limit is 100.
+    """
+    now_ts = datetime.now(TZ).timestamp()
+    cached = cycle_sgo_events_cache.get("events") or []
+
+    if cached and now_ts - cycle_sgo_events_cache.get("ts", 0) <= CYCLE_SGO_EVENTS_CACHE_SECONDS:
+        return cached
+
     params = {
         "leagueID": SPORTSGAMEODDS_MLB_LEAGUE_ID or "MLB",
         "oddsAvailable": "true",
         "bookmakerID": SPORTSGAMEODDS_FANDUEL_BOOKMAKER_ID or "fanduel",
-        "limit": "500",
+        "limit": "100",
     }
+
     try:
-        # SportsGameOdds docs list GET /events/ and support leagueID, oddsAvailable,
-        # bookmakerID, and limit. Keep this request simple to avoid 400 Invalid params.
-        return sgo_get_json("/events/", params=params)
+        payload = sgo_get_json("/events/", params=params)
+        events = []
+
+        if isinstance(payload, dict):
+            for key in ("events", "data", "results"):
+                if isinstance(payload.get(key), list):
+                    events = payload.get(key)
+                    break
+            if not events:
+                events = [d for d in flatten_dicts(payload) if d.get("eventID") or d.get("id")]
+        elif isinstance(payload, list):
+            events = payload
+
+        cycle_sgo_events_cache["ts"] = now_ts
+        cycle_sgo_events_cache["events"] = events or []
+        log.info("SportsGameOdds events cached: %s", len(events or []))
+        return events or []
+
     except Exception as exc:
         log.warning("SportsGameOdds /events failed. Check SPORTSGAMEODDS_API_KEY and leagueID=MLB. Error: %s", exc)
+        return cached or []
+
+def sgo_event_id(d):
+    if not isinstance(d, dict):
         return None
+    for key in ("eventID", "eventId", "id", "gameID", "gameId"):
+        if d.get(key):
+            return d.get(key)
+    return None
+
+def find_sgo_event_for_game(game):
+    events = fetch_sgo_events()
+    for ev in events:
+        if sgo_event_matches_game(ev, game):
+            return ev
+    return None
+
+def fetch_sgo_event_odds(event_id):
+    """
+    Fetch and cache odds for one SportsGameOdds event.
+    Uses eventID to avoid scanning the entire slate repeatedly.
+    """
+    if not event_id:
+        return None
+
+    now_ts = datetime.now(TZ).timestamp()
+    cache_key = str(event_id)
+    cached = cycle_sgo_event_odds_cache.get(cache_key)
+
+    if cached and now_ts - cached.get("ts", 0) <= CYCLE_SGO_EVENT_ODDS_CACHE_SECONDS:
+        return cached.get("payload")
+
+    params = {
+        "eventID": event_id,
+        "bookmakerID": SPORTSGAMEODDS_FANDUEL_BOOKMAKER_ID or "fanduel",
+        "oddsAvailable": "true",
+        "limit": "100",
+    }
+
+    try:
+        # Prefer odds endpoint. If the user's plan/endpoint differs, fallback to /events with eventID.
+        try:
+            payload = sgo_get_json("/odds/", params=params)
+        except Exception:
+            payload = sgo_get_json("/events/", params=params)
+
+        cycle_sgo_event_odds_cache[cache_key] = {"ts": now_ts, "payload": payload}
+        return payload
+
+    except Exception as exc:
+        log.warning("SportsGameOdds event odds failed eventID=%s error=%s", event_id, exc)
+        cycle_sgo_event_odds_cache[cache_key] = {"ts": now_ts, "payload": None}
+        return None
+
 
 def fetch_sgo_player_prop(game, player_name, missing):
     if not ENABLE_CYCLE_SGO_ODDS or not SPORTSGAMEODDS_API_KEY:
@@ -1327,22 +1406,29 @@ def fetch_sgo_player_prop(game, player_name, missing):
     cache_key = f"sgo:{game.get('gamePk')}:{player_name}:{missing}"
     now_ts = datetime.now(TZ).timestamp()
     cached = cycle_sgo_cache.get(cache_key)
+
     if cached and now_ts - cached.get("ts", 0) <= CYCLE_SGO_CACHE_SECONDS:
         return cached.get("value")
 
     value = None
+
     try:
-        # First pull slate events. This works on plans that require leagueID.
-        payload = fetch_sgo_events()
+        sgo_event = find_sgo_event_for_game(game)
+        event_id = sgo_event_id(sgo_event)
+
+        if not event_id:
+            log.warning("SportsGameOdds event match not found for %s", game_label(game))
+            cycle_sgo_cache[cache_key] = {"ts": now_ts, "value": None}
+            return None
+
+        payload = fetch_sgo_event_odds(event_id)
         candidates = list(flatten_dicts(payload))
 
-        # Narrow to this game when possible.
-        game_candidates = [d for d in candidates if sgo_event_matches_game(d, game)]
-        search_pool = game_candidates or candidates
+        matches = [
+            d for d in candidates
+            if sgo_market_matches(d, player_name, missing)
+        ]
 
-        matches = [d for d in search_pool if sgo_market_matches(d, player_name, missing)]
-
-        # Prefer outcomes with a price and link.
         matches.sort(
             key=lambda d: (
                 1 if sgo_extract_link(d) else 0,
@@ -1355,6 +1441,7 @@ def fetch_sgo_player_prop(game, player_name, missing):
             best = matches[0]
             price = sgo_extract_price(best)
             link = sgo_extract_link(best)
+
             value = {
                 "book": "FanDuel",
                 "source": "SportsGameOdds",
@@ -1372,86 +1459,6 @@ def fetch_sgo_player_prop(game, player_name, missing):
     cycle_sgo_cache[cache_key] = {"ts": now_ts, "value": value}
     return value
 
-
-def fetch_fanduel_player_prop(game, player_name, missing):
-    if not ENABLE_CYCLE_FANDUEL_ODDS or not ODDS_API_KEY:
-        return None
-
-    market_key = cycle_market_for_missing(missing)
-    cache_key = f"{game.get('gamePk')}:{player_name}:{market_key}"
-    now_ts = datetime.now(TZ).timestamp()
-
-    cached = cycle_odds_cache.get(cache_key)
-    if cached and now_ts - cached.get("ts", 0) <= CYCLE_ODDS_CACHE_SECONDS:
-        return cached.get("value")
-
-    try:
-        odds_event = find_odds_event_for_game(game)
-        if not odds_event or not odds_event.get("id"):
-            value = None
-        else:
-            url = f"{ODDS_API_BASE}/sports/{ODDS_SPORT_KEY}/events/{odds_event['id']}/odds"
-            data = get_odds_json(
-                url,
-                {
-                    "apiKey": ODDS_API_KEY,
-                    "regions": ODDS_REGION,
-                    "markets": market_key,
-                    "bookmakers": CYCLE_FANDUEL_BOOKMAKER_KEY,
-                    "oddsFormat": ODDS_FORMAT,
-                },
-            )
-
-            value = None
-            for book in data.get("bookmakers", []) or []:
-                book_key = str(book.get("key") or "").lower()
-                book_title = str(book.get("title") or "").lower()
-
-                if "fanduel" not in book_key and "fanduel" not in book_title:
-                    continue
-
-                for market in book.get("markets", []) or []:
-                    if market.get("key") != market_key:
-                        continue
-
-                    for outcome in market.get("outcomes", []) or []:
-                        desc = outcome.get("description") or outcome.get("name") or ""
-                        name = outcome.get("name") or ""
-                        target_text = f"{desc} {name}"
-
-                        # Player props usually have player in description and Over/Yes in name.
-                        if not names_match(player_name, target_text):
-                            continue
-
-                        odds_price = outcome.get("price")
-                        point = outcome.get("point")
-                        link = extract_any_link(outcome, market, book, data)
-
-                        value = {
-                            "book": book.get("title") or "FanDuel",
-                            "marketKey": market_key,
-                            "market": market.get("key") or market_key,
-                            "player": player_name,
-                            "outcomeName": outcome.get("name"),
-                            "description": outcome.get("description"),
-                            "price": odds_price,
-                            "oddsText": american_odds_text(odds_price),
-                            "point": point,
-                            "link": link,
-                        }
-                        break
-                    if value:
-                        break
-                if value:
-                    break
-
-        cycle_odds_cache[cache_key] = {"ts": now_ts, "value": value}
-        return value
-
-    except Exception as exc:
-        log.warning("Could not load FanDuel cycle prop odds for %s missing %s: %s", player_name, missing, exc)
-        cycle_odds_cache[cache_key] = {"ts": now_ts, "value": None}
-        return None
 
 def fanduel_prop_display(odds_row, fallback_links):
     if odds_row:
