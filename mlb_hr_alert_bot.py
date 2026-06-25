@@ -112,6 +112,10 @@ CYCLE_SGO_MARKET_TRIPLE_KEYWORDS = os.getenv("CYCLE_SGO_MARKET_TRIPLE_KEYWORDS",
 CYCLE_SGO_MARKET_DOUBLE_KEYWORDS = os.getenv("CYCLE_SGO_MARKET_DOUBLE_KEYWORDS", "double,doubles,batter_doubles")
 CYCLE_SGO_MARKET_HIT_KEYWORDS = os.getenv("CYCLE_SGO_MARKET_HIT_KEYWORDS", "hit,hits,batter_hits")
 cycle_sgo_cache = {}
+cycle_sgo_events_cache = {"ts": 0, "events": []}
+cycle_sgo_event_odds_cache = {}
+CYCLE_SGO_EVENTS_CACHE_SECONDS = int(os.getenv("CYCLE_SGO_EVENTS_CACHE_SECONDS", "300"))
+CYCLE_SGO_EVENT_ODDS_CACHE_SECONDS = int(os.getenv("CYCLE_SGO_EVENT_ODDS_CACHE_SECONDS", "60"))
 
 # Morning HR parlay section in daily report
 ENABLE_MORNING_HR_PARLAYS = os.getenv("ENABLE_MORNING_HR_PARLAYS", "true").lower() == "true"
@@ -1592,6 +1596,70 @@ def collect_cycle_watch_candidates(game, plays):
 
     return candidates
 
+async def update_cycle_watch_message_with_odds(message, game, row, props, primary_link):
+    if not message:
+        return
+
+    try:
+        fd_rows = []
+        link_lines = []
+        best_link = primary_link or FANDUEL_MLB_DEEPLINK
+
+        for prop in props:
+            fanduel_odds = await asyncio.to_thread(
+                fetch_sgo_player_prop,
+                game,
+                row["name"],
+                prop["missing"]
+            )
+
+            fd_display = fanduel_prop_display(fanduel_odds, prop["links"])
+
+            if best_link == FANDUEL_MLB_DEEPLINK and fd_display.get("link"):
+                best_link = fd_display["link"]
+
+            fd_rows.append(
+                f"• **{prop['prop']}** — {fd_display['odds']}\n"
+                f"  [FanDuel Link]({fd_display['link']})"
+            )
+
+            check_links = unique_links([fd_display["link"]] + prop["links"])
+            for idx, link in enumerate(check_links[:3], start=1):
+                link_lines.append(f"[{prop['missing']} Link {idx}]({link})")
+
+        if not message.embeds:
+            return
+
+        embed = message.embeds[0]
+        embed.url = best_link
+
+        old_fields = list(embed.fields)
+        embed.clear_fields()
+
+        for field in old_fields:
+            if field.name in ("FanDuel Odds / Deep Links", "FanDuel Links To Check"):
+                continue
+            embed.add_field(name=field.name, value=field.value, inline=field.inline)
+
+        embed.add_field(
+            name="FanDuel Odds / Deep Links",
+            value="\n".join(fd_rows) if fd_rows else "FanDuel props not found yet.",
+            inline=False,
+        )
+
+        if link_lines:
+            embed.add_field(
+                name="FanDuel Links To Check",
+                value=" • ".join(link_lines[:8]),
+                inline=False,
+            )
+
+        await message.edit(embed=embed)
+
+    except Exception as exc:
+        log.warning("Could not update cycle alert with FanDuel odds: %s", exc)
+
+
 async def maybe_send_cycle_watch_alerts(channel, game, plays):
     if not ENABLE_CYCLE_WATCH:
         return
@@ -1615,34 +1683,6 @@ async def maybe_send_cycle_watch_alerts(channel, game, plays):
 
         props = cycle_props_for_missing_list(missing_list, row["name"])
 
-        fd_rows = []
-        primary_link = FANDUEL_MLB_DEEPLINK
-        link_lines = []
-
-        for prop in props:
-            fanduel_odds = await asyncio.to_thread(
-                fetch_sgo_player_prop,
-                game,
-                row["name"],
-                prop["missing"]
-            )
-
-            # SportsGameOdds only. Do not fall back to The Odds API.
-            fd_display = fanduel_prop_display(fanduel_odds, prop["links"])
-
-            if primary_link == FANDUEL_MLB_DEEPLINK and fd_display.get("link"):
-                primary_link = fd_display["link"]
-
-            fd_rows.append(
-                f"• **{prop['prop']}** — {fd_display['odds']}\n"
-                f"  [FanDuel Link]({fd_display['link']})"
-            )
-
-            check_links = unique_links([fd_display["link"]] + prop["links"])
-            for idx, link in enumerate(check_links[:3], start=1):
-                label = f"{prop['missing']} Link {idx}"
-                link_lines.append(f"[{label}]({link})")
-
         has_1b = "✅" if "1B" in row["hits"] else "❌"
         has_2b = "✅" if "2B" in row["hits"] else "❌"
         has_3b = "✅" if "3B" in row["hits"] else "❌"
@@ -1655,6 +1695,11 @@ async def maybe_send_cycle_watch_alerts(channel, game, plays):
             title = "🚲 Live Cycle Prop Watch — 2 of 4"
             intro = f"**{row['name']} ({row['team_abbr']})** has 2 of 4 cycle legs."
 
+        prop_lines = [
+            f"• **{prop['prop']}** — looking up FanDuel odds/link..."
+            for prop in props
+        ]
+
         embed = discord.Embed(
             title=title,
             description=(
@@ -1664,23 +1709,21 @@ async def maybe_send_cycle_watch_alerts(channel, game, plays):
                 f"{has_3b} Triple\n"
                 f"{has_hr} Home Run\n\n"
                 f"🎯 **Remaining Props:**\n"
-                + "\n".join(fd_rows)
+                + "\n".join(prop_lines)
             ),
             color=discord.Color.teal(),
-            url=primary_link,
+            url=FANDUEL_MLB_DEEPLINK,
         )
 
         embed.add_field(name="Game", value=game_label(game), inline=False)
         embed.add_field(name="Cycle Progress", value=stage, inline=True)
         embed.add_field(name="Hits Today", value=str(len(row["hit_events"])), inline=True)
         embed.add_field(name="Missing Legs", value=", ".join(missing_list), inline=True)
-
-        if link_lines:
-            embed.add_field(
-                name="FanDuel Links To Check",
-                value=" • ".join(link_lines[:8]),
-                inline=False
-            )
+        embed.add_field(
+            name="FanDuel Odds / Deep Links",
+            value="Looking up FanDuel odds and deep links from SportsGameOdds...",
+            inline=False,
+        )
 
         headshot_url = player_headshot(row.get("player_id"))
         if headshot_url:
@@ -1691,13 +1734,23 @@ async def maybe_send_cycle_watch_alerts(channel, game, plays):
             embed.set_thumbnail(url=logo_url)
 
         embed.set_footer(
-            text=f"Trigger: {CYCLE_WATCH_MIN_LEGS}+ of 4 cycle legs after inning {CYCLE_WATCH_MIN_INNING}. Links point to remaining prop legs."
+            text="Real-time trigger from MLB live feed. FanDuel odds/links update after post."
         )
-
-        await safe_discord_send(target_channel, embed=embed)
 
         state["seen_cycle_alerts"].append(alert_key)
         save_state()
+
+        msg = await safe_discord_send(target_channel, embed=embed)
+
+        asyncio.create_task(
+            update_cycle_watch_message_with_odds(
+                msg,
+                game,
+                row,
+                props,
+                FANDUEL_MLB_DEEPLINK,
+            )
+        )
 
 
 # =========================

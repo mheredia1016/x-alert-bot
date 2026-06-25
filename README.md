@@ -1,19 +1,12 @@
-# MLB HR Alert Bot — Cycle Watch 2-of-4 with Cached SportsGameOdds
+# MLB HR Alert Bot — Real-Time Cycle Alerts
 
-Live bot update.
-
-Fixes:
-- SportsGameOdds limit changed to 100.
-- Caches MLB events instead of calling /events for every prop.
-- Matches MLB game to SportsGameOdds event once.
-- Fetches/caches event odds for that event.
-- Cycle Watch remains SportsGameOdds-only.
+Cycle Watch now posts immediately from MLB live feed, then edits the same Discord message with FanDuel odds/deep links after SportsGameOdds returns.
 
 Required:
-- DISCORD_NEAR_HR_CHANNEL_ID=<near HR channel id>
+- DISCORD_NEAR_HR_CHANNEL_ID
 - ENABLE_CYCLE_WATCH=true
-- DISCORD_CYCLE_CHANNEL_ID=<cycle channel id>
-- SPORTSGAMEODDS_API_KEY=<your SportsGameOdds key>
+- DISCORD_CYCLE_CHANNEL_ID
+- SPORTSGAMEODDS_API_KEY
 - SPORTSGAMEODDS_MLB_LEAGUE_ID=MLB
 - ENABLE_CYCLE_SGO_ODDS=true
 
@@ -21,6 +14,3 @@ Recommended:
 - CYCLE_WATCH_MIN_INNING=5
 - CYCLE_WATCH_MIN_LEGS=2
 - SPORTSGAMEODDS_FANDUEL_BOOKMAKER_ID=fanduel
-- CYCLE_SGO_EVENTS_CACHE_SECONDS=300
-- CYCLE_SGO_EVENT_ODDS_CACHE_SECONDS=60
-- CYCLE_SGO_CACHE_SECONDS=45
