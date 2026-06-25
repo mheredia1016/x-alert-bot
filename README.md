@@ -1,6 +1,16 @@
-# MLB HR Alert Bot — Real-Time Cycle Alerts
+# MLB HR Alert Bot — Cycle Alerts with Game Context
 
-Cycle Watch now posts immediately from MLB live feed, then edits the same Discord message with FanDuel odds/deep links after SportsGameOdds returns.
+Adds inning/game context to live Cycle Watch alerts.
+
+Cycle alert now includes:
+- Current inning
+- Outs
+- Score
+- Hits today
+- AB
+- RBI
+- Missing legs
+- FanDuel odds/deep links update after the alert posts
 
 Required:
 - DISCORD_NEAR_HR_CHANNEL_ID

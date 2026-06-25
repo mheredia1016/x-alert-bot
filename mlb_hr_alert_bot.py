@@ -1298,16 +1298,70 @@ def sgo_market_matches(d, player_name, missing):
     keywords = sgo_keywords_for_missing(missing)
     return any(k in blob for k in keywords)
 
+
+MLB_TEAM_ALIASES = {
+    "AZ": ["arizona diamondbacks", "diamondbacks", "ari", "az"],
+    "ATL": ["atlanta braves", "braves", "atl"],
+    "BAL": ["baltimore orioles", "orioles", "bal"],
+    "BOS": ["boston red sox", "red sox", "bos"],
+    "CHC": ["chicago cubs", "cubs", "chc"],
+    "CWS": ["chicago white sox", "white sox", "chw", "cws"],
+    "CIN": ["cincinnati reds", "reds", "cin"],
+    "CLE": ["cleveland guardians", "guardians", "cle"],
+    "COL": ["colorado rockies", "rockies", "col"],
+    "DET": ["detroit tigers", "tigers", "det"],
+    "HOU": ["houston astros", "astros", "hou"],
+    "KC": ["kansas city royals", "royals", "kc", "kcr"],
+    "LAA": ["los angeles angels", "la angels", "angels", "laa"],
+    "LAD": ["los angeles dodgers", "la dodgers", "dodgers", "lad"],
+    "MIA": ["miami marlins", "marlins", "mia"],
+    "MIL": ["milwaukee brewers", "brewers", "mil"],
+    "MIN": ["minnesota twins", "twins", "min"],
+    "NYM": ["new york mets", "mets", "nym"],
+    "NYY": ["new york yankees", "yankees", "nyy"],
+    "ATH": ["athletics", "oakland athletics", "ath", "oak"],
+    "OAK": ["athletics", "oakland athletics", "ath", "oak"],
+    "PHI": ["philadelphia phillies", "phillies", "phi"],
+    "PIT": ["pittsburgh pirates", "pirates", "pit"],
+    "SD": ["san diego padres", "padres", "sd"],
+    "SEA": ["seattle mariners", "mariners", "sea"],
+    "SF": ["san francisco giants", "giants", "sf", "sfg"],
+    "STL": ["st louis cardinals", "st. louis cardinals", "cardinals", "stl"],
+    "TB": ["tampa bay rays", "rays", "tb", "tbr"],
+    "TEX": ["texas rangers", "rangers", "tex"],
+    "TOR": ["toronto blue jays", "blue jays", "tor"],
+    "WSH": ["washington nationals", "nationals", "wsh", "was"],
+}
+
+def team_aliases_for_game_team(team):
+    aliases = set()
+    abbr = str(team.get("abbreviation") or team.get("fileCode") or "").upper()
+    if abbr in MLB_TEAM_ALIASES:
+        aliases.update(MLB_TEAM_ALIASES[abbr])
+
+    for key in ("name", "teamName", "clubName", "shortName", "abbreviation", "fileCode"):
+        val = team.get(key)
+        if val:
+            aliases.add(str(val).lower())
+
+    return [normalize_name_for_match(x) for x in aliases if x]
+
+def sgo_blob_normalized(d):
+    return normalize_name_for_match(sgo_text_blob(d))
+
+
 def sgo_event_matches_game(d, game):
-    blob = sgo_text_blob(d)
+    blob = sgo_blob_normalized(d)
     away = game.get("away") or {}
     home = game.get("home") or {}
-    checks = [
-        away.get("name"), away.get("teamName"), away.get("abbreviation"),
-        home.get("name"), home.get("teamName"), home.get("abbreviation"),
-    ]
-    found = [x for x in checks if x and normalize_name_for_match(x) in normalize_name_for_match(blob)]
-    return len(found) >= 2
+
+    away_aliases = team_aliases_for_game_team(away)
+    home_aliases = team_aliases_for_game_team(home)
+
+    away_hit = any(alias and alias in blob for alias in away_aliases)
+    home_hit = any(alias and alias in blob for alias in home_aliases)
+
+    return away_hit and home_hit
 
 def fetch_sgo_events():
     """
@@ -1363,6 +1417,16 @@ def find_sgo_event_for_game(game):
     for ev in events:
         if sgo_event_matches_game(ev, game):
             return ev
+
+    # Helpful one-line debug so we can see SportsGameOdds event naming if matching fails.
+    try:
+        sample = []
+        for ev in events[:5]:
+            sample.append(sgo_text_blob(ev)[:180])
+        log.warning("SportsGameOdds event match not found for %s. Cached events=%s sample=%s", game_label(game), len(events), sample)
+    except Exception:
+        log.warning("SportsGameOdds event match not found for %s", game_label(game))
+
     return None
 
 def fetch_sgo_event_odds(event_id):
@@ -1421,7 +1485,6 @@ def fetch_sgo_player_prop(game, player_name, missing):
         event_id = sgo_event_id(sgo_event)
 
         if not event_id:
-            log.warning("SportsGameOdds event match not found for %s", game_label(game))
             cycle_sgo_cache[cache_key] = {"ts": now_ts, "value": None}
             return None
 
@@ -1596,6 +1659,103 @@ def collect_cycle_watch_candidates(game, plays):
 
     return candidates
 
+
+def cycle_current_game_context(plays):
+    latest = None
+
+    for play in plays:
+        about = play.get("about", {}) or {}
+        result = play.get("result", {}) or {}
+
+        if about.get("inning") is None:
+            continue
+
+        latest = {
+            "inning": about.get("inning"),
+            "half": (about.get("halfInning") or "").title(),
+            "outs": about.get("outs"),
+            "awayScore": result.get("awayScore"),
+            "homeScore": result.get("homeScore"),
+        }
+
+    if not latest:
+        return {
+            "inningText": "Live",
+            "outsText": "—",
+            "scoreText": "—",
+        }
+
+    inning = latest.get("inning") or "?"
+    half = latest.get("half") or ""
+    outs = latest.get("outs")
+    away_score = latest.get("awayScore")
+    home_score = latest.get("homeScore")
+
+    if outs is None:
+        outs_text = "—"
+    else:
+        outs_text = f"{outs} Out" if int(outs) == 1 else f"{outs} Outs"
+
+    if away_score is None or home_score is None:
+        score_text = "—"
+    else:
+        score_text = f"{away_score} - {home_score}"
+
+    return {
+        "inningText": f"{half} {inning}".strip(),
+        "outsText": outs_text,
+        "scoreText": score_text,
+    }
+
+
+def cycle_player_box_from_plays(row, plays):
+    batter_id = row.get("player_id")
+    batter_name = row.get("name")
+    hits = 0
+    at_bats = 0
+    rbi = 0
+
+    # Approximate live box from completed plays.
+    # Good enough for alert context without extra API calls.
+    non_ab_events = {
+        "walk", "intent_walk", "hit_by_pitch", "sac_bunt", "sac_fly",
+        "catcher_interf", "catcher_interference",
+    }
+
+    for play in plays:
+        matchup = play.get("matchup", {}) or {}
+        batter = matchup.get("batter", {}) or {}
+        pid = batter.get("id")
+        name = batter.get("fullName")
+
+        if batter_id:
+            if pid != batter_id:
+                continue
+        elif name != batter_name:
+            continue
+
+        result = play.get("result", {}) or {}
+        event_type = (result.get("eventType") or "").lower().strip()
+
+        if event_type and event_type not in non_ab_events:
+            # Count likely official AB events. This may include ROE/FC, which is fine for live context.
+            at_bats += 1
+
+        if hit_type_from_play(play):
+            hits += 1
+
+        try:
+            rbi += int(result.get("rbi", 0) or 0)
+        except Exception:
+            pass
+
+    return {
+        "hits": hits,
+        "atBats": at_bats,
+        "rbi": rbi,
+    }
+
+
 async def update_cycle_watch_message_with_odds(message, game, row, props, primary_link):
     if not message:
         return
@@ -1672,6 +1832,8 @@ async def maybe_send_cycle_watch_alerts(channel, game, plays):
         "cycle-watch"
     )
 
+    game_context = cycle_current_game_context(plays)
+
     for row in collect_cycle_watch_candidates(game, plays):
         missing_list = row.get("missing", [])
         stage = row.get("cycle_stage", f"{row.get('hit_leg_count', len(row.get('hits', [])))}/4")
@@ -1682,6 +1844,7 @@ async def maybe_send_cycle_watch_alerts(channel, game, plays):
             continue
 
         props = cycle_props_for_missing_list(missing_list, row["name"])
+        player_box = cycle_player_box_from_plays(row, plays)
 
         has_1b = "✅" if "1B" in row["hits"] else "❌"
         has_2b = "✅" if "2B" in row["hits"] else "❌"
@@ -1704,6 +1867,7 @@ async def maybe_send_cycle_watch_alerts(channel, game, plays):
             title=title,
             description=(
                 f"{intro}\n\n"
+                f"**Current Game State:** {game_context['inningText']} • {game_context['outsText']} • Score {game_context['scoreText']}\n\n"
                 f"{has_1b} Single\n"
                 f"{has_2b} Double\n"
                 f"{has_3b} Triple\n"
@@ -1716,8 +1880,13 @@ async def maybe_send_cycle_watch_alerts(channel, game, plays):
         )
 
         embed.add_field(name="Game", value=game_label(game), inline=False)
+        embed.add_field(name="Current Inning", value=game_context["inningText"], inline=True)
+        embed.add_field(name="Outs", value=game_context["outsText"], inline=True)
+        embed.add_field(name="Score", value=game_context["scoreText"], inline=True)
         embed.add_field(name="Cycle Progress", value=stage, inline=True)
-        embed.add_field(name="Hits Today", value=str(len(row["hit_events"])), inline=True)
+        embed.add_field(name="Hits Today", value=str(player_box.get("hits", len(row["hit_events"]))), inline=True)
+        embed.add_field(name="AB", value=str(player_box.get("atBats", "—")), inline=True)
+        embed.add_field(name="RBI", value=str(player_box.get("rbi", "—")), inline=True)
         embed.add_field(name="Missing Legs", value=", ".join(missing_list), inline=True)
         embed.add_field(
             name="FanDuel Odds / Deep Links",
